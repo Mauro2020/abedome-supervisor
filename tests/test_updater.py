@@ -66,6 +66,22 @@ async def test_fetch_versions(
 
 
 @pytest.mark.usefixtures("no_job_throttle")
+async def test_fetch_versions_from_configured_feed(
+    coresys: CoreSys, mock_update_data: MockResponse, supervisor_internet: AsyncMock
+) -> None:
+    """Fetch version data from a configured feed URL template."""
+
+    coresys.security.force = True
+    with patch(
+        "supervisor.updater.URL_HASSIO_VERSION",
+        "https://updates.example.invalid/{channel}.json",
+    ):
+        await coresys.updater.fetch_data()
+
+    assert coresys.websession.get.call_args[0][0] == "https://updates.example.invalid/stable.json"
+
+
+@pytest.mark.usefixtures("no_job_throttle")
 @pytest.mark.parametrize(
     ("version", "expected"),
     [
