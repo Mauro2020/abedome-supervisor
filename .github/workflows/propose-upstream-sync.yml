@@ -1,0 +1,60 @@
+name: Propose Home Assistant Supervisor sync
+
+on:
+  schedule:
+    - cron: "37 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  propose:
+    name: Propose upstream Supervisor sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out ABEDOME product branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: abedome/develop
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream
+        run: |
+          git config user.name "ABEDOME update bot"
+          git config user.email "noreply@users.noreply.github.com"
+          git remote add upstream https://github.com/home-assistant/supervisor.git
+          git fetch --no-tags upstream main
+
+      - name: Prepare a proposed sync branch
+        id: sync
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git checkout -B automation/upstream-supervisor abedome/develop
+          git merge --no-ff upstream/main -m "Sync Home Assistant Supervisor upstream"
+          git push --force https://x-access-token:$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY.git automation/upstream-supervisor
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or refresh a draft pull request
+        if: steps.sync.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing="$(gh pr list --head automation/upstream-supervisor --base abedome/develop --state open --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "Sync Home Assistant Supervisor upstream"
+            exit 0
+          fi
+
+          gh pr create \
+            --base abedome/develop \
+            --head automation/upstream-supervisor \
+            --draft \
+            --title "Sync Home Assistant Supervisor upstream" \
+            --body "Proposed upstream sync. This pull request is never merged automatically; review the diff and promote only after the ABEDOME release checks have passed."
