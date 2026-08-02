@@ -30,6 +30,8 @@ jobs:
 
       - name: Prepare a proposed sync branch
         id: sync
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
