@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "product": "ABEDOME Supervisor",
+  "upstream": "home-assistant/supervisor",
+  "upstream_default_branch": "main",
+  "product_branch": "abedome/develop",
+  "strategy": "weekly-upstream-draft-pull-request",
+  "approval_required": true,
+  "auto_merge": false,
+  "runtime_update_feed": {
+    "environment_variable": "SUPERVISOR_VERSION_URL",
+    "url_template": "https://<abedome-update-host>/{channel}.json",
+    "enabled": false,
+    "activation_requires": [
+      "immutable ABEDOME version manifest",
+      "signed ABEDOME OS release artifacts",
+      "private production RAUC signing key",
+      "ABEDOME OS launcher configuration"
+    ]
+  }
+}
