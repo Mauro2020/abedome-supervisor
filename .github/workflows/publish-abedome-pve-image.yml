@@ -79,6 +79,16 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+
+      - name: Refuse to overwrite an existing version
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE_REFERENCE}" >/dev/null 2>&1; then
+            echo "Refusing to overwrite the existing immutable image: ${IMAGE_REFERENCE}"
+            exit 1
+          fi
+
       - name: Build and publish versioned image
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
