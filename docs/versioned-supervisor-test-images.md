@@ -17,7 +17,7 @@ That exact value is used for both:
 - the Supervisor version embedded in the image.
 
 The workflow permits only pre-release test versions in the form
-`YYYY.M.P.devN`. It will not publish a mutable `latest` tag.
+`YYYY.M.P.devN`. It will not publish a mutable `latest` tag, and it stops before publishing if the requested version tag already exists.
 
 ## Safe use
 
