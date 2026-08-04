@@ -1,10 +1,10 @@
-name: Publish ABEDOME Supervisor PVE image
+name: Publish versioned ABEDOME Supervisor test image
 
 on:
   workflow_dispatch:
     inputs:
-      image_tag:
-        description: "Immutable test tag, for example pve-7a80dabad258"
+      supervisor_version:
+        description: "Immutable ABEDOME test version, for example 2026.8.0.dev1"
         required: true
         type: string
 
@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: abedome-supervisor-pve-image
+  group: abedome-supervisor-versioned-image
   cancel-in-progress: false
 
 jobs:
@@ -42,7 +42,7 @@ jobs:
           tox -e tests --skip-pkg-install -- --timeout=30
 
   publish:
-    name: Publish x86-64 test image
+    name: Publish x86-64 versioned test image
     needs: test
     runs-on: ubuntu-24.04
     steps:
@@ -51,25 +51,23 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate immutable test tag
+      - name: Validate immutable test version
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          SUPERVISOR_VERSION: ${{ inputs.supervisor_version }}
         run: |
-          case "${IMAGE_TAG}" in
-            "" | -* | *..* | *[!a-zA-Z0-9._-]*)
-              echo "Use a non-empty tag made only of letters, digits, dots, underscores, and dashes."
-              exit 1
-              ;;
-          esac
+          if ! printf '%s' "${SUPERVISOR_VERSION}" | grep -Eq '^[0-9]{4}\.[0-9]{1,2}\.[0-9]+\.dev[0-9]+$'; then
+            echo "Use a test version such as 2026.8.0.dev1."
+            exit 1
+          fi
 
       - name: Derive container reference
         id: image
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          SUPERVISOR_VERSION: ${{ inputs.supervisor_version }}
         run: |
           owner="${REPOSITORY_OWNER,,}"
-          echo "reference=ghcr.io/${owner}/abedome-supervisor:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "reference=ghcr.io/${owner}/abedome-supervisor:${SUPERVISOR_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
@@ -81,18 +79,19 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish PVE image
+      - name: Build and publish versioned image
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
           build-args: |
-            BUILD_VERSION=9999.09.9.dev${{ github.run_number }}
+            BUILD_VERSION=${{ inputs.supervisor_version }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.description=ABEDOME Supervisor PVE validation image
+            org.opencontainers.image.version=${{ inputs.supervisor_version }}
+            org.opencontainers.image.description=ABEDOME Supervisor versioned test image
           tags: ${{ steps.image.outputs.reference }}
           push: true
           provenance: mode=max
@@ -106,13 +105,16 @@ jobs:
       - name: Publish summary
         env:
           IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
+          SUPERVISOR_VERSION: ${{ inputs.supervisor_version }}
         run: |
           {
-            echo "## ABEDOME Supervisor PVE image"
+            echo "## ABEDOME Supervisor versioned test image"
             echo
             echo "- Image: \`${IMAGE_REFERENCE}\`"
+            echo "- Supervisor version: \`${SUPERVISOR_VERSION}\`"
             echo "- Architecture: \`linux/amd64\`"
             echo "- Source revision: \`${GITHUB_SHA}\`"
             echo
+            echo "The image tag and Supervisor version are intentionally identical."
             echo "This is a test image only. It does not activate the ABEDOME update feed."
           } >> "$GITHUB_STEP_SUMMARY"
