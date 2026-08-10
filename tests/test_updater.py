@@ -78,7 +78,10 @@ async def test_fetch_versions_from_configured_feed(
     ):
         await coresys.updater.fetch_data()
 
-    assert coresys.websession.get.call_args[0][0] == "https://updates.example.invalid/stable.json"
+    assert (
+        coresys.websession.get.call_args[0][0]
+        == "https://updates.example.invalid/stable.json"
+    )
 
 
 @pytest.mark.usefixtures("no_job_throttle")
