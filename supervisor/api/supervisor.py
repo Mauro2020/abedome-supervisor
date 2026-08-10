@@ -8,6 +8,7 @@ from typing import Any
 from aiohttp import web
 import voluptuous as vol
 
+from ..brand import apply_upstream_diagnostics_policy
 from ..const import (
     ATTR_ADDONS,
     ATTR_APPS_REPOSITORIES,
@@ -162,10 +163,13 @@ class APISupervisor(CoreSysAttributes):
             self.sys_config.debug_block = body[ATTR_DEBUG_BLOCK]
 
         if ATTR_DIAGNOSTICS in body:
-            self.sys_config.diagnostics = body[ATTR_DIAGNOSTICS]
-            await self.sys_dbus.agent.set_diagnostics(body[ATTR_DIAGNOSTICS])
+            diagnostics: bool = apply_upstream_diagnostics_policy(
+                body[ATTR_DIAGNOSTICS]
+            )
+            self.sys_config.diagnostics = diagnostics
+            await self.sys_dbus.agent.set_diagnostics(diagnostics)
 
-            if body[ATTR_DIAGNOSTICS]:
+            if diagnostics:
                 init_sentry(self.coresys)
             else:
                 close_sentry()

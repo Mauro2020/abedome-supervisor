@@ -8,6 +8,7 @@ from typing import Any
 from awesomeversion import AwesomeVersion
 from dbus_fast.aio.message_bus import MessageBus
 
+from ...brand import apply_upstream_diagnostics_policy
 from ...exceptions import DBusInterfaceError, DBusServiceUnkownError
 from ..const import (
     DBUS_ATTR_DIAGNOSTICS,
@@ -135,6 +136,13 @@ class OSAgent(DBusInterfaceProxy):
     async def update(self, changed: dict[str, Any] | None = None) -> None:
         """Update Properties."""
         await super().update(changed)
+
+        if (
+            self.diagnostics is True
+            and apply_upstream_diagnostics_policy(self.diagnostics) is False
+        ):
+            await self.set_diagnostics(False)
+            self.properties[DBUS_ATTR_DIAGNOSTICS] = False
 
         if not changed:
             await asyncio.gather(
