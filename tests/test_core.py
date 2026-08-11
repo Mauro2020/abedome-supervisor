@@ -11,14 +11,21 @@ import pytest
 
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
+from supervisor.dbus.const import DBUS_ATTR_DIAGNOSTICS
 from supervisor.exceptions import AppFileReadError, HassioError, WhoamiSSLError
 from supervisor.host.control import SystemControl
 from supervisor.host.info import InfoCenter
-from supervisor.resolution.const import IssueType, SuggestionType, UnhealthyReason
+from supervisor.resolution.const import (
+    IssueType,
+    SuggestionType,
+    UnhealthyReason,
+    UnsupportedReason,
+)
 from supervisor.supervisor import Supervisor
 from supervisor.utils.whoami import WhoamiData
 
 from tests.dbus_service_mocks.base import DBusServiceMock
+from tests.dbus_service_mocks.os_agent import OSAgent as OSAgentService
 from tests.dbus_service_mocks.systemd import Systemd as SystemdService
 from tests.dbus_service_mocks.systemd_unit import SystemdUnit as SystemdUnitService
 
@@ -238,6 +245,30 @@ async def test_setup_unhandled_exception_captured(
     capture_mock.assert_called_once()
     assert "Fatal error happening on load Task" in caplog.text
     assert UnhealthyReason.SETUP in coresys.resolution.unhealthy
+
+
+@pytest.mark.parametrize("unsupported", [False, True])
+async def test_restart_disables_active_os_agent_diagnostics(
+    coresys: CoreSys,
+    all_dbus_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
+    unsupported: bool,
+):
+    """Test restart disables active OS-Agent diagnostics on every system."""
+    os_agent_service: OSAgentService = all_dbus_services["os_agent"]
+    coresys.dbus.agent.properties[DBUS_ATTR_DIAGNOSTICS] = True
+    assert coresys.dbus.agent.diagnostics is True
+
+    if unsupported:
+        coresys.resolution.unsupported.add(UnsupportedReason.OS)
+
+    coresys.config.diagnostics = True
+    coresys.config.save_data.reset_mock()
+    await coresys.core._sync_diagnostics()
+
+    await os_agent_service.ping()
+    assert coresys.config.diagnostics is False
+    assert coresys.dbus.agent.diagnostics is False
+    coresys.config.save_data.assert_awaited_once()
 
 
 async def test_shutdown_reentrant_waits(coresys: CoreSys):

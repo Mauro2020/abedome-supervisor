@@ -1,6 +1,9 @@
 """Test OSAgent dbus interface."""
 
 # pylint: disable=import-error
+import asyncio
+from unittest.mock import patch
+
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 
@@ -22,7 +25,7 @@ async def fixture_os_agent_service(
 async def test_dbus_osagent(
     os_agent_service: OSAgentService, dbus_session_bus: MessageBus
 ):
-    """Test OS Agent properties."""
+    """Test OS Agent properties and the ABEDOME diagnostics guard."""
     os_agent = OSAgent()
 
     assert os_agent.version is None
@@ -31,16 +34,28 @@ async def test_dbus_osagent(
     await os_agent.connect(dbus_session_bus)
 
     assert os_agent.version == "1.1.0"
-    assert os_agent.diagnostics
+    assert os_agent.diagnostics is False
 
     os_agent_service.emit_properties_changed({"Diagnostics": False})
     await os_agent_service.ping()
     assert os_agent.diagnostics is False
 
-    os_agent_service.emit_properties_changed({}, ["Diagnostics"])
-    await os_agent_service.ping()
-    await os_agent_service.ping()
-    assert os_agent.diagnostics is True
+    diagnostics_disabled = asyncio.Event()
+    set_diagnostics = os_agent.set_diagnostics
+
+    async def set_diagnostics_and_signal(value: bool) -> None:
+        await set_diagnostics(value)
+        diagnostics_disabled.set()
+
+    with patch.object(
+        os_agent, "set_diagnostics", side_effect=set_diagnostics_and_signal
+    ) as set_diagnostics_mock:
+        os_agent_service.emit_properties_changed({}, ["Diagnostics"])
+        await os_agent_service.ping()
+        await asyncio.wait_for(diagnostics_disabled.wait(), timeout=1)
+
+    set_diagnostics_mock.assert_called_once_with(False)
+    assert os_agent.diagnostics is False
 
 
 @pytest.mark.parametrize(
