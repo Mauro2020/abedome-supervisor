@@ -108,12 +108,23 @@ class HomeAssistantCore(JobGroup):
 
             await self.instance.attach(version=version, skip_state_event_if_down=True)
 
-            # Ensure we are using correct image for this system (unless user has overridden it)
+            # An image from the update feed is managed, even if it was previously
+            # persisted as an override while recovering from a failed reconciliation.
+            managed_image = self.sys_updater.image_homeassistant
+            if (
+                self.sys_homeassistant.override_image
+                and managed_image
+                and self.sys_homeassistant.image == managed_image
+            ):
+                self.sys_homeassistant.override_image = False
+
+            # Ensure we are using the image managed by the update feed (unless the
+            # user has overridden it). If update information is unavailable, keep
+            # using the persisted image rather than switching registries.
             if not self.sys_homeassistant.override_image:
-                await self.instance.check_image(
-                    version, self.sys_homeassistant.default_image
-                )
-                self.sys_homeassistant.set_image(self.sys_homeassistant.default_image)
+                expected_image = managed_image or self.sys_homeassistant.image
+                await self.instance.check_image(version, expected_image)
+                self.sys_homeassistant.set_image(expected_image)
         except DockerError:
             _LOGGER.info(
                 "No Home Assistant Docker image %s found.", self.sys_homeassistant.image

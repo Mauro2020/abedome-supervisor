@@ -822,14 +822,23 @@ async def test_core_loads_wrong_image_for_machine(
     coresys.homeassistant.set_image("ghcr.io/home-assistant/odroid-n2-homeassistant")
     coresys.homeassistant.version = AwesomeVersion("2024.4.0")
 
-    with patch.object(
-        DockerAPI,
-        "pull_image",
-        return_value={
-            "Id": "abc123",
-            "Config": {"Labels": {"io.hass.version": "2024.4.0"}},
-        },
-    ) as pull_image:
+    with (
+        patch.object(
+            Updater,
+            "image_homeassistant",
+            new=PropertyMock(
+                return_value="ghcr.io/home-assistant/qemux86-64-homeassistant"
+            ),
+        ),
+        patch.object(
+            DockerAPI,
+            "pull_image",
+            return_value={
+                "Id": "abc123",
+                "Config": {"Labels": {"io.hass.version": "2024.4.0"}},
+            },
+        ) as pull_image,
+    ):
         container.show.return_value |= pull_image.return_value
         await coresys.homeassistant.core.load()
         pull_image.assert_called_once_with(
@@ -852,6 +861,88 @@ async def test_core_loads_wrong_image_for_machine(
     assert (
         coresys.homeassistant.image == "ghcr.io/home-assistant/qemux86-64-homeassistant"
     )
+
+
+async def test_core_load_uses_managed_image_from_update_feed(
+    coresys: CoreSys, container: DockerContainer
+):
+    """Test core load keeps the image managed by the update feed."""
+    image = "ghcr.io/mauro2020/abedome-core"
+    version = AwesomeVersion("2026.9.1.dev6")
+    coresys.homeassistant.set_image(image)
+    coresys.homeassistant.version = version
+    container.show.return_value["Config"] = {
+        "Labels": {"io.hass.version": str(version)}
+    }
+
+    with patch.object(
+        Updater,
+        "image_homeassistant",
+        new=PropertyMock(return_value=image),
+    ):
+        await coresys.homeassistant.core.load()
+
+    coresys.docker.images.inspect.assert_awaited_once_with(f"{image}:{version}")
+    container.delete.assert_not_called()
+    coresys.docker.images.delete.assert_not_called()
+    coresys.docker.images.pull.assert_not_called()
+    assert coresys.homeassistant.image == image
+    assert coresys.homeassistant.override_image is False
+
+
+async def test_core_load_keeps_persisted_image_when_update_feed_unavailable(
+    coresys: CoreSys, container: DockerContainer
+):
+    """Test core load keeps its persisted image without update information."""
+    image = "ghcr.io/mauro2020/abedome-core"
+    version = AwesomeVersion("2026.9.1.dev6")
+    coresys.homeassistant.set_image(image)
+    coresys.homeassistant.version = version
+    container.show.return_value["Config"] = {
+        "Labels": {"io.hass.version": str(version)}
+    }
+
+    with patch.object(
+        Updater,
+        "image_homeassistant",
+        new=PropertyMock(return_value=None),
+    ):
+        await coresys.homeassistant.core.load()
+
+    coresys.docker.images.inspect.assert_awaited_once_with(f"{image}:{version}")
+    container.delete.assert_not_called()
+    coresys.docker.images.delete.assert_not_called()
+    coresys.docker.images.pull.assert_not_called()
+    assert coresys.homeassistant.image == image
+    assert coresys.homeassistant.override_image is False
+
+
+async def test_core_load_restores_managed_state_for_feed_image_override(
+    coresys: CoreSys, container: DockerContainer
+):
+    """Test a feed image persisted as an override returns to managed state."""
+    image = "ghcr.io/mauro2020/abedome-core"
+    version = AwesomeVersion("2026.9.1.dev6")
+    coresys.homeassistant.set_image(image)
+    coresys.homeassistant.override_image = True
+    coresys.homeassistant.version = version
+    container.show.return_value["Config"] = {
+        "Labels": {"io.hass.version": str(version)}
+    }
+
+    with patch.object(
+        Updater,
+        "image_homeassistant",
+        new=PropertyMock(return_value=image),
+    ):
+        await coresys.homeassistant.core.load()
+
+    coresys.docker.images.inspect.assert_awaited_once_with(f"{image}:{version}")
+    container.delete.assert_not_called()
+    coresys.docker.images.delete.assert_not_called()
+    coresys.docker.images.pull.assert_not_called()
+    assert coresys.homeassistant.image == image
+    assert coresys.homeassistant.override_image is False
 
 
 @pytest.mark.usefixtures("path_extern")
@@ -979,11 +1070,20 @@ async def test_core_loads_wrong_image_for_architecture(
     )
     container.show.return_value |= img_data
 
-    with patch.object(
-        DockerAPI,
-        "pull_image",
-        return_value=img_data | {"Architecture": "amd64"},
-    ) as pull_image:
+    with (
+        patch.object(
+            Updater,
+            "image_homeassistant",
+            new=PropertyMock(
+                return_value="ghcr.io/home-assistant/qemux86-64-homeassistant"
+            ),
+        ),
+        patch.object(
+            DockerAPI,
+            "pull_image",
+            return_value=img_data | {"Architecture": "amd64"},
+        ) as pull_image,
+    ):
         await coresys.homeassistant.core.load()
         pull_image.assert_called_once_with(
             ANY,

@@ -117,6 +117,28 @@ async def test_api_set_image(
     assert coresys.homeassistant.override_image is False
 
 
+async def test_api_set_managed_image(
+    core_api_client_with_root: tuple[TestClient, str], coresys: CoreSys
+):
+    """Test setting the update feed image does not create an override."""
+    api_client, root = core_api_client_with_root
+    image = "ghcr.io/mauro2020/abedome-core"
+
+    with (
+        patch.object(
+            Updater,
+            "image_homeassistant",
+            new=PropertyMock(return_value=image),
+        ),
+        patch.object(HomeAssistant, "save_data"),
+    ):
+        resp = await api_client.post(f"{root}/options", json={"image": image})
+
+    assert resp.status == 200
+    assert coresys.homeassistant.image == image
+    assert coresys.homeassistant.override_image is False
+
+
 async def test_api_restart(
     core_api_client_with_root: tuple[TestClient, str],
     container: DockerContainer,
