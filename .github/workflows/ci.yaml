@@ -302,7 +302,7 @@ jobs:
       - name: Generate partial mypy restore key
         id: generate-mypy-key
         run: |
-          mypy_version=$(cat requirements_test.txt | grep mypy | cut -d '=' -f 3)
+          mypy_version=$(grep '^mypy==' requirements_tests.txt | cut -d '=' -f 3)
           echo "version=$mypy_version" >> $GITHUB_OUTPUT
           echo "key=mypy-${{ env.MYPY_CACHE_VERSION }}-$mypy_version-$(date -u '+%Y-%m-%dT%H:%M:%s')" >> $GITHUB_OUTPUT
       - name: Restore Python virtual environment
