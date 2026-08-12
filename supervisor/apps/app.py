@@ -258,7 +258,7 @@ class App(AppModel):
             self.sys_resolution.dismiss_issue(access_issue)
 
         self.sys_homeassistant.websocket.supervisor_event_custom(
-            WSEvent.ADDON,
+            WSEvent.APP,
             {
                 ATTR_SLUG: self.slug,
                 ATTR_STATE: new_state,
@@ -293,7 +293,7 @@ class App(AppModel):
             self.has_deprecated_machine and not self.has_supported_machine
         ):
             self.sys_resolution.create_issue(
-                IssueType.DEPRECATED_ARCH_ADDON,
+                IssueType.DEPRECATED_ARCH_APP,
                 ContextType.ADDON,
                 reference=self.slug,
                 suggestions=[SuggestionType.EXECUTE_REMOVE],
