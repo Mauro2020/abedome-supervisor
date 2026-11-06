@@ -201,7 +201,7 @@ async def test_api_supervisor_options_diagnostics(
     coresys: CoreSys,
     os_agent_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ):
-    """Test changing diagnostics."""
+    """Test diagnostics requests remain disabled by ABEDOME policy."""
     api_client, prefix = api_client_with_prefix
     os_agent_service: OSAgentService = os_agent_services["os_agent"]
     os_agent_service.Diagnostics = False
@@ -213,10 +213,11 @@ async def test_api_supervisor_options_diagnostics(
             f"{prefix}/supervisor/options", json={"diagnostics": True}
         )
         assert response.status == 200
-        sentry_init.assert_called_once()
+        sentry_init.assert_not_called()
 
     await os_agent_service.ping()
-    assert coresys.dbus.agent.diagnostics is True
+    assert coresys.config.diagnostics is False
+    assert coresys.dbus.agent.diagnostics is False
 
     with patch("supervisor.api.supervisor.close_sentry") as close_sentry:
         response = await api_client.post(

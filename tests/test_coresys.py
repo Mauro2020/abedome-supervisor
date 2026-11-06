@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from datetime import timedelta
 import gc
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 import weakref
 
@@ -17,6 +18,23 @@ from supervisor.coresys import CoreSys
 from supervisor.dbus.timedate import TimeDate
 from supervisor.jobs.decorator import Job
 from supervisor.utils.dt import utcnow
+
+
+@pytest.mark.parametrize("historical_diagnostics", [None, True])
+async def test_load_config_disables_historical_diagnostics(
+    tmp_path, historical_diagnostics: bool | None
+) -> None:
+    """Test historical diagnostics consent is disabled and persisted."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"diagnostics": historical_diagnostics}), encoding="utf-8"
+    )
+
+    with patch("supervisor.config.FILE_HASSIO_CONFIG", config_path):
+        loaded_coresys = await CoreSys().load_config()
+
+    assert loaded_coresys.config.diagnostics is False
+    assert json.loads(config_path.read_text(encoding="utf-8"))["diagnostics"] is False
 
 
 async def test_timezone(coresys: CoreSys):

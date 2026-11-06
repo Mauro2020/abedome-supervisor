@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from supervisor.brand import ABEDOME_CORE_IMAGE
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
 from supervisor.resolution.evaluations.home_assistant_core_custom_image import (
@@ -15,7 +16,7 @@ from supervisor.resolution.evaluations.home_assistant_core_custom_image import (
     ("image", "expected"),
     [
         (None, False),  # Unset, default image is used
-        ("ghcr.io/home-assistant/qemux86-64-homeassistant", False),  # Default image
+        (ABEDOME_CORE_IMAGE, False),  # ABEDOME-managed image
         ("myorg/qemux86-64-homeassistant", True),  # Fork on another registry
         ("ghcr.io/myorg/qemux86-64-homeassistant", True),  # Fork on same registry
     ],

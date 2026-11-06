@@ -31,7 +31,7 @@ async def test_dbus_osagent(
     await os_agent.connect(dbus_session_bus)
 
     assert os_agent.version == "1.1.0"
-    assert os_agent.diagnostics
+    assert os_agent.diagnostics is False
 
     os_agent_service.emit_properties_changed({"Diagnostics": False})
     await os_agent_service.ping()
@@ -40,7 +40,7 @@ async def test_dbus_osagent(
     os_agent_service.emit_properties_changed({}, ["Diagnostics"])
     await os_agent_service.ping()
     await os_agent_service.ping()
-    assert os_agent.diagnostics is True
+    assert os_agent.diagnostics is False
 
 
 @pytest.mark.parametrize(

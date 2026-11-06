@@ -8,6 +8,7 @@ from typing import Any
 from aiohttp import web
 import voluptuous as vol
 
+from ..brand import is_managed_core_image
 from ..const import (
     ATTR_ARCH,
     ATTR_AUDIO_INPUT,
@@ -123,8 +124,9 @@ class APIHomeAssistant(CoreSysAttributes):
 
         if ATTR_IMAGE in body:
             self.sys_homeassistant.set_image(body[ATTR_IMAGE])
-            self.sys_homeassistant.override_image = (
-                self.sys_homeassistant.image != self.sys_homeassistant.default_image
+            self.sys_homeassistant.override_image = not is_managed_core_image(
+                self.sys_homeassistant.image,
+                self.sys_updater.image_homeassistant,
             )
 
         if ATTR_BOOT in body:

@@ -15,6 +15,7 @@ from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.threading import ThreadingIntegration
 from sentry_sdk.scrubber import DEFAULT_DENYLIST, EventScrubber
 
+from ..brand import apply_upstream_diagnostics_policy
 from ..const import SUPERVISOR_VERSION
 from ..coresys import CoreSys
 from ..misc.filter import filter_data
@@ -26,6 +27,9 @@ only_once_events: set[str] = set()
 
 def init_sentry(coresys: CoreSys) -> None:
     """Initialize sentry client."""
+    if apply_upstream_diagnostics_policy(coresys.config.diagnostics) is not True:
+        return
+
     if not sentry_sdk.is_initialized():
         _LOGGER.info("Initializing Supervisor Sentry")
         denylist = DEFAULT_DENYLIST + ["psk", "ssid", "ssids"]

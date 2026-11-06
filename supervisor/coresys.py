@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Self, TypeVar
 import aiohttp
 from pycares import AresError
 
+from .brand import apply_upstream_diagnostics_policy
 from .config import CoreConfig
 from .const import (
     ENV_HOMEASSISTANT_REPOSITORY,
@@ -116,6 +117,12 @@ class CoreSys:
     async def load_config(self) -> Self:
         """Load config in executor."""
         await self.config.read_data()
+
+        diagnostics = apply_upstream_diagnostics_policy(self.config.diagnostics)
+        if diagnostics is not None and self.config.diagnostics != diagnostics:
+            self.config.diagnostics = diagnostics
+            await self.config.save_data()
+
         return self
 
     async def init_websession(self) -> None:

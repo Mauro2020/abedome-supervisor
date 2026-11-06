@@ -19,7 +19,7 @@ from tests.dbus_service_mocks.network_manager import (
     NetworkManager as NetworkManagerService,
 )
 
-URL_TEST = "https://version.home-assistant.io/stable.json"
+URL_TEST = "https://mauro2020.github.io/abedome-os/updates/stable.json"
 
 
 @pytest.mark.usefixtures("no_job_throttle")
@@ -153,8 +153,26 @@ async def test_delayed_fetch_for_connectivity(
     coresys.websession.get.assert_called_once()
     assert (
         coresys.websession.get.call_args[0][0]
-        == "https://version.home-assistant.io/stable.json"
+        == "https://mauro2020.github.io/abedome-os/updates/stable.json"
     )
+
+
+@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
+async def test_fetch_versions_rejects_non_abedome_images(
+    coresys: CoreSys, mock_update_data: MockResponse
+) -> None:
+    """Test a manifest cannot switch Core or Supervisor to upstream images."""
+    data_before = deepcopy(coresys.updater._data)  # pylint: disable=protected-access
+    version_data = json.loads(await mock_update_data.text())
+    version_data["images"]["core"] = "ghcr.io/home-assistant/{machine}-homeassistant"
+    mock_update_data.update_text(json.dumps(version_data))
+
+    task = await coresys.updater.fetch_data()
+    assert task
+    with pytest.raises(UpdaterError, match="does not reference the ABEDOME"):
+        await task
+
+    assert coresys.updater._data == data_before  # pylint: disable=protected-access
 
 
 @pytest.mark.usefixtures("no_job_throttle")

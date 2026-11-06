@@ -7,6 +7,7 @@ from datetime import timedelta
 import logging
 from typing import Final, Self
 
+from .brand import apply_upstream_diagnostics_policy
 from .const import (
     ATTR_STARTUP,
     RUN_SUPERVISOR_STATE,
@@ -217,15 +218,7 @@ class Core(CoreSysAttributes):
         """Start Supervisor orchestration."""
         await self.set_state(CoreState.STARTUP)
 
-        # Set OS Agent diagnostics if needed
-        if (
-            self.sys_dbus.agent.is_connected
-            and self.sys_config.diagnostics is not None
-            and self.sys_dbus.agent.diagnostics != self.sys_config.diagnostics
-            and self.supported
-        ):
-            _LOGGER.debug("Set OS Agent diagnostics to %s", self.sys_config.diagnostics)
-            await self.sys_dbus.agent.set_diagnostics(self.sys_config.diagnostics)
+        await self._sync_diagnostics()
 
         # Check if system is healthy
         if not self.supported:
@@ -352,6 +345,24 @@ class Core(CoreSysAttributes):
                 "supervisor", {ATTR_STARTUP: "complete"}
             )
             _LOGGER.info("Supervisor is up and running")
+
+    async def _sync_diagnostics(self) -> None:
+        """Apply the ABEDOME diagnostics policy to Supervisor and OS-Agent."""
+        diagnostics = apply_upstream_diagnostics_policy(self.sys_config.diagnostics)
+        if diagnostics is None:
+            return
+
+        if self.sys_config.diagnostics != diagnostics:
+            self.sys_config.diagnostics = diagnostics
+            await self.sys_config.save_data()
+
+        if (
+            self.sys_dbus.agent.is_connected
+            and self.sys_dbus.agent.diagnostics != diagnostics
+            and (not diagnostics or self.supported)
+        ):
+            _LOGGER.debug("Set OS Agent diagnostics to %s", diagnostics)
+            await self.sys_dbus.agent.set_diagnostics(diagnostics)
 
     async def stop(self, *, stopping_complete: asyncio.Event | None = None) -> None:
         """Stop a running orchestration.

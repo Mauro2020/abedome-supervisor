@@ -14,6 +14,7 @@ from dbus_fast import DBusError
 import pytest
 from time_machine import travel
 
+from supervisor.brand import ABEDOME_CORE_IMAGE
 from supervisor.const import CpuArch
 from supervisor.coresys import CoreSys
 from supervisor.dbus.const import DBUS_ERR_SYSTEMD_NO_SUCH_UNIT
@@ -691,9 +692,7 @@ async def test_start(
 
         block_till_run.assert_called_once()
         run.assert_called_once()
-        assert (
-            run.call_args.args[0] == "ghcr.io/home-assistant/qemux86-64-homeassistant"
-        )
+        assert run.call_args.args[0] == ABEDOME_CORE_IMAGE
         assert run.call_args.kwargs["tag"] == AwesomeVersion("2023.7.0")
         assert run.call_args.kwargs["name"] == "homeassistant"
         assert run.call_args.kwargs["hostname"] == "homeassistant"
@@ -982,7 +981,7 @@ async def test_core_loads_wrong_image_for_machine(
         await coresys.homeassistant.core.load()
         pull_image.assert_called_once_with(
             ANY,
-            "ghcr.io/home-assistant/qemux86-64-homeassistant",
+            ABEDOME_CORE_IMAGE,
             "2024.4.0",
             platform="linux/amd64",
             auth=None,
@@ -997,9 +996,7 @@ async def test_core_loads_wrong_image_for_machine(
         "ghcr.io/home-assistant/odroid-n2-homeassistant:2024.4.0",
         force=True,
     )
-    assert (
-        coresys.homeassistant.image == "ghcr.io/home-assistant/qemux86-64-homeassistant"
-    )
+    assert coresys.homeassistant.image == ABEDOME_CORE_IMAGE
 
 
 @pytest.mark.usefixtures("path_extern")
@@ -1135,7 +1132,7 @@ async def test_core_loads_wrong_image_for_architecture(
         await coresys.homeassistant.core.load()
         pull_image.assert_called_once_with(
             ANY,
-            "ghcr.io/home-assistant/qemux86-64-homeassistant",
+            ABEDOME_CORE_IMAGE,
             "2024.4.0",
             platform="linux/amd64",
             auth=None,
@@ -1143,16 +1140,14 @@ async def test_core_loads_wrong_image_for_architecture(
 
     container.delete.assert_called_once_with(force=True, v=True)
     assert coresys.docker.images.delete.call_args_list[0] == call(
-        "ghcr.io/home-assistant/qemux86-64-homeassistant:latest",
+        f"{ABEDOME_CORE_IMAGE}:latest",
         force=True,
     )
     assert coresys.docker.images.delete.call_args_list[1] == call(
-        "ghcr.io/home-assistant/qemux86-64-homeassistant:2024.4.0",
+        f"{ABEDOME_CORE_IMAGE}:2024.4.0",
         force=True,
     )
-    assert (
-        coresys.homeassistant.image == "ghcr.io/home-assistant/qemux86-64-homeassistant"
-    )
+    assert coresys.homeassistant.image == ABEDOME_CORE_IMAGE
 
 
 def _lose_core_image(coresys: CoreSys) -> None:
@@ -1166,7 +1161,7 @@ def _lose_core_image(coresys: CoreSys) -> None:
 async def test_load_missing_image_reinstalls_stored_version(
     coresys: CoreSys, caplog: pytest.LogCaptureFixture
 ):
-    """Test a lost image of an installed Core is reinstalled at the same version.
+    """Test a lost image is reinstalled from ABEDOME while the feed is offline.
 
     When the Docker storage is wiped (e.g. storage driver migration) the image
     of the installed Core is gone. Supervisor must reinstall the version that
@@ -1176,28 +1171,33 @@ async def test_load_missing_image_reinstalls_stored_version(
     coresys.homeassistant.version = AwesomeVersion("2026.2.3")
     _lose_core_image(coresys)
 
-    with patch.object(
-        DockerAPI,
-        "pull_image",
-        return_value={
-            "Id": "abc123",
-            "Config": {"Labels": {"io.hass.version": "2026.2.3"}},
-        },
-    ) as pull_image:
+    with (
+        patch.object(
+            Updater,
+            "image_homeassistant",
+            new=PropertyMock(return_value=None),
+        ),
+        patch.object(
+            DockerAPI,
+            "pull_image",
+            return_value={
+                "Id": "abc123",
+                "Config": {"Labels": {"io.hass.version": "2026.2.3"}},
+            },
+        ) as pull_image,
+    ):
         await coresys.homeassistant.core.load()
 
     pull_image.assert_called_once_with(
         ANY,
-        "ghcr.io/home-assistant/qemux86-64-homeassistant",
+        ABEDOME_CORE_IMAGE,
         "2026.2.3",
         platform="linux/amd64",
         auth=None,
     )
     coresys.docker.containers.create.assert_not_called()
     assert coresys.homeassistant.version == AwesomeVersion("2026.2.3")
-    assert (
-        coresys.homeassistant.image == "ghcr.io/home-assistant/qemux86-64-homeassistant"
-    )
+    assert coresys.homeassistant.image == ABEDOME_CORE_IMAGE
     assert "Reinstalling Home Assistant 2026.2.3" in caplog.text
 
 
@@ -1260,7 +1260,7 @@ async def test_load_missing_image_fresh_install_uses_landingpage(
 
     pull_image.assert_called_once_with(
         ANY,
-        "ghcr.io/home-assistant/qemux86-64-homeassistant",
+        ABEDOME_CORE_IMAGE,
         LANDINGPAGE,
         platform="linux/amd64",
         auth=None,

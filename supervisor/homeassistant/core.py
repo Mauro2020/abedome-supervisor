@@ -143,12 +143,22 @@ class HomeAssistantCore(JobGroup):
 
             await self.instance.attach(version=version, skip_state_event_if_down=True)
 
-            # Ensure we are using correct image for this system (unless user has overridden it)
+            # A feed image is managed, even if an older recovery persisted it as
+            # an override. Without update data, retain the persisted ABEDOME image.
+            managed_image = self.sys_updater.image_homeassistant
+            if (
+                self.sys_homeassistant.override_image
+                and managed_image
+                and self.sys_homeassistant.image == managed_image
+            ):
+                self.sys_homeassistant.override_image = False
+
+            # Reconcile only to an ABEDOME-managed image. Never switch registry
+            # merely because the update feed is temporarily unavailable.
             if not self.sys_homeassistant.override_image:
-                await self.instance.check_image(
-                    version, self.sys_homeassistant.default_image
-                )
-                self.sys_homeassistant.set_image(self.sys_homeassistant.default_image)
+                expected_image = self.sys_homeassistant.install_image
+                await self.instance.check_image(version, expected_image)
+                self.sys_homeassistant.set_image(expected_image)
         except DockerError:
             _LOGGER.info(
                 "No Home Assistant Docker image %s found.", self.sys_homeassistant.image

@@ -12,6 +12,7 @@ import aiohttp
 from aiohttp.client_exceptions import ClientError
 from awesomeversion import AwesomeVersion, AwesomeVersionException
 
+from .brand import ABEDOME_SUPERVISOR_IMAGE
 from .const import (
     ATTR_SUPERVISOR_INTERNET,
     SUPERVISOR_VERSION,
@@ -123,7 +124,7 @@ class Supervisor(CoreSysAttributes):
     @property
     def default_image(self) -> str:
         """Return the default image for this system."""
-        return f"ghcr.io/home-assistant/{self.sys_arch.supervisor}-hassio-supervisor"
+        return ABEDOME_SUPERVISOR_IMAGE
 
     @property
     def image(self) -> str | None:

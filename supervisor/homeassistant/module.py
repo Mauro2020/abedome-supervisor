@@ -15,6 +15,7 @@ from securetar import AddFileError, SecureTarError, SecureTarFile, atomic_conten
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
+from ..brand import ABEDOME_CORE_IMAGE
 from ..const import (
     ATTR_ACCESS_TOKEN,
     ATTR_AUDIO_INPUT,
@@ -209,7 +210,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
     @property
     def default_image(self) -> str:
         """Return the default image for this system."""
-        return f"ghcr.io/home-assistant/{self.sys_machine}-homeassistant"
+        return ABEDOME_CORE_IMAGE
 
     @property
     def image(self) -> str:

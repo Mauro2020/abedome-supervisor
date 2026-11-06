@@ -9,6 +9,7 @@ from typing import Any
 import aiohttp
 from awesomeversion import AwesomeVersion
 
+from .brand import ABEDOME_CORE_IMAGE, ABEDOME_SUPERVISOR_IMAGE
 from .bus import EventListener
 from .const import (
     ATTR_AUDIO,
@@ -164,18 +165,20 @@ class Updater(FileConfiguration, CoreSysAttributes):
         """Return image of Home Assistant docker."""
         if ATTR_HOMEASSISTANT not in self._data[ATTR_IMAGE]:
             return None
-        return self._data[ATTR_IMAGE][ATTR_HOMEASSISTANT].format(
+        image = self._data[ATTR_IMAGE][ATTR_HOMEASSISTANT].format(
             machine=self.sys_machine
         )
+        return image if image == ABEDOME_CORE_IMAGE else None
 
     @property
     def image_supervisor(self) -> str | None:
         """Return image of Supervisor docker."""
         if ATTR_SUPERVISOR not in self._data[ATTR_IMAGE]:
             return None
-        return self._data[ATTR_IMAGE][ATTR_SUPERVISOR].format(
+        image = self._data[ATTR_IMAGE][ATTR_SUPERVISOR].format(
             arch=self.sys_arch.supervisor
         )
+        return image if image == ABEDOME_SUPERVISOR_IMAGE else None
 
     @property
     def image_cli(self) -> str | None:
@@ -353,6 +356,16 @@ class Updater(FileConfiguration, CoreSysAttributes):
             raise UpdaterError(
                 f"Can't process version data: {err}", _LOGGER.warning
             ) from err
+
+        if (
+            images[ATTR_HOMEASSISTANT] != ABEDOME_CORE_IMAGE
+            or images[ATTR_SUPERVISOR] != ABEDOME_SUPERVISOR_IMAGE
+        ):
+            raise UpdaterError(
+                "Update manifest does not reference the ABEDOME Core and "
+                "Supervisor images",
+                _LOGGER.warning,
+            )
 
         self._data.update(versions)
         self._data[ATTR_IMAGE].update(images)

@@ -1,13 +1,13 @@
 """Unit tests for Sentry."""
 
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sentry_sdk.worker import BackgroundWorker
 
 from supervisor.bootstrap import initialize_coresys, warning_handler
-from supervisor.utils.sentry import async_capture_message
+from supervisor.utils.sentry import async_capture_message, init_sentry
 
 
 @pytest.mark.usefixtures("supervisor_name", "docker")
@@ -19,6 +19,21 @@ async def test_sentry_disabled_by_default():
     ):
         await initialize_coresys()
         sentry_init.assert_not_called()
+
+
+def test_sentry_initialization_disabled_by_brand_policy() -> None:
+    """Test ABEDOME policy prevents Sentry even if diagnostics was requested."""
+    coresys = MagicMock()
+    coresys.config.diagnostics = True
+
+    with (
+        patch("supervisor.utils.sentry.sentry_sdk.is_initialized") as is_initialized,
+        patch("supervisor.utils.sentry.sentry_sdk.init") as sentry_init,
+    ):
+        init_sentry(coresys)
+
+    is_initialized.assert_not_called()
+    sentry_init.assert_not_called()
 
 
 def test_sentry_sdk_background_worker_thread_name():

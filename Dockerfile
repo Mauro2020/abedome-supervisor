@@ -73,15 +73,22 @@ COPY rootfs /
 
 FROM supervisor-base
 
+ARG BUILD_VERSION="9999.09.9.dev9999"
+ARG BUILD_REVISION="unknown"
+
 # Copy everything from the build stage as a single layer
 # hadolint ignore=DL3067
 COPY --from=supervisor-build / /
 
 LABEL \
     io.hass.type="supervisor" \
-    org.opencontainers.image.title="Home Assistant Supervisor" \
-    org.opencontainers.image.description="Container-based system for managing Home Assistant Core installation" \
-    org.opencontainers.image.authors="The Home Assistant Authors" \
-    org.opencontainers.image.url="https://www.home-assistant.io/" \
-    org.opencontainers.image.documentation="https://www.home-assistant.io/docs/" \
+    io.hass.version="${BUILD_VERSION}" \
+    org.opencontainers.image.title="ABEDOME Supervisor" \
+    org.opencontainers.image.description="ABEDOME system manager, derived from Home Assistant Supervisor" \
+    org.opencontainers.image.authors="ABEDOME contributors; derived from the Home Assistant Authors" \
+    org.opencontainers.image.url="https://github.com/Mauro2020/abedome-supervisor" \
+    org.opencontainers.image.source="https://github.com/Mauro2020/abedome-supervisor" \
+    org.opencontainers.image.documentation="https://github.com/Mauro2020/abedome-supervisor" \
+    org.opencontainers.image.version="${BUILD_VERSION}" \
+    org.opencontainers.image.revision="${BUILD_REVISION}" \
     org.opencontainers.image.licenses="Apache License 2.0"
