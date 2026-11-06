@@ -1,0 +1,20 @@
+{
+  "product": "ABEDOME Supervisor",
+  "version": "2026.10.5",
+  "upstream": {
+    "repository": "https://github.com/home-assistant/supervisor",
+    "commit": "fdba115f215c61f7a02c7c0567263785cfcf0034",
+    "tag": "2026.10.5"
+  },
+  "runtime": {
+    "core_image": "ghcr.io/mauro2020/abedome-core",
+    "supervisor_image": "ghcr.io/mauro2020/abedome-supervisor",
+    "update_feed": "https://mauro2020.github.io/abedome-os/updates/{channel}.json"
+  },
+  "release": {
+    "supported_platform": "ABEDOME OS OVA",
+    "architectures": ["linux/amd64"],
+    "multiarch": false,
+    "feed_publication": "external gated step; never performed by the image workflow"
+  }
+}
