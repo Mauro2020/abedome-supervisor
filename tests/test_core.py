@@ -11,6 +11,7 @@ from awesomeversion import AwesomeVersion
 from dbus_fast import DBusError, ErrorType, Variant
 import pytest
 
+from supervisor.brand import ABEDOME_SUPERVISOR_IMAGE
 from supervisor.const import AppStartup, CoreState
 from supervisor.coresys import CoreSys
 from supervisor.dbus.const import DBUS_ERR_SYSTEMD_NO_SUCH_UNIT
@@ -880,7 +881,7 @@ async def test_start_awaits_supervisor_auto_update(
     coresys.updater.auto_update = True
     # pylint: disable-next=protected-access
     coresys.updater._data.setdefault("image", {})["supervisor"] = (
-        "ghcr.io/home-assistant/amd64-hassio-supervisor"
+        ABEDOME_SUPERVISOR_IMAGE
     )
     with (
         patch.object(Supervisor, "need_update", new=PropertyMock(return_value=True)),

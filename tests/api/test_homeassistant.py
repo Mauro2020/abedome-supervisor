@@ -494,7 +494,7 @@ async def test_config_check(
 
     coresys.docker.containers.create.assert_called_once_with(
         {
-            "Image": "ghcr.io/home-assistant/qemux86-64-homeassistant:2025.1.0",
+            "Image": f"{ABEDOME_CORE_IMAGE}:2025.1.0",
             "Labels": {"supervisor_managed": ""},
             "OpenStdin": False,
             "StdinOnce": False,

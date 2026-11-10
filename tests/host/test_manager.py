@@ -31,7 +31,7 @@ async def test_load(coresys: CoreSys, systemd_service: SystemdService):
         assert coresys.dbus.hostname.hostname == "homeassistant-n2"
         assert coresys.dbus.systemd.boot_timestamp == 1632236713344227
         assert coresys.dbus.timedate.timezone == "Etc/UTC"
-        assert coresys.dbus.agent.diagnostics is True
+        assert coresys.dbus.agent.diagnostics is False
         assert coresys.dbus.network.connectivity_enabled is True
         assert coresys.dbus.resolved.multicast_dns == MulticastProtocolEnabled.RESOLVE
         assert coresys.dbus.agent.apparmor.version == "2.13.2"

@@ -9,6 +9,7 @@ from aiohttp.client_exceptions import ClientError
 from awesomeversion import AwesomeVersion
 import pytest
 
+from supervisor.brand import ABEDOME_SUPERVISOR_IMAGE
 from supervisor.const import BusEvent, CoreState, UpdateChannel
 from supervisor.coresys import CoreSys
 from supervisor.docker.supervisor import DockerSupervisor
@@ -210,7 +211,7 @@ async def test_update_failed(coresys: CoreSys, capture_exception: Mock):
     """Test update failure."""
     # pylint: disable-next=protected-access
     coresys.updater._data.setdefault("image", {})["supervisor"] = (
-        "ghcr.io/home-assistant/aarch64-hassio-supervisor"
+        ABEDOME_SUPERVISOR_IMAGE
     )
     err = DockerError()
     with (
@@ -233,7 +234,7 @@ async def test_update_returns_running_task_for_concurrent_call(coresys: CoreSys)
     """Test a second update call while one is running gets back the same task."""
     # pylint: disable-next=protected-access
     coresys.updater._data.setdefault("image", {})["supervisor"] = (
-        "ghcr.io/home-assistant/aarch64-hassio-supervisor"
+        ABEDOME_SUPERVISOR_IMAGE
     )
     install_started = asyncio.Event()
     install_finish = asyncio.Event()
