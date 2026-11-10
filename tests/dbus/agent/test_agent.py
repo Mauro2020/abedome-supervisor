@@ -1,10 +1,13 @@
 """Test OSAgent dbus interface."""
 
 # pylint: disable=import-error
+from unittest.mock import AsyncMock, patch
+
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 
 from supervisor.dbus.agent import OSAgent
+from supervisor.dbus.const import DBUS_ATTR_DIAGNOSTICS
 
 from tests.common import mock_dbus_services
 from tests.dbus_service_mocks.base import DBusServiceMock
@@ -40,6 +43,25 @@ async def test_dbus_osagent(
     os_agent_service.emit_properties_changed({}, ["Diagnostics"])
     await os_agent_service.ping()
     await os_agent_service.ping()
+    assert os_agent.diagnostics is False
+
+    os_agent.properties[DBUS_ATTR_DIAGNOSTICS] = True
+    assert os_agent.diagnostics is False
+
+
+@pytest.mark.usefixtures("os_agent_service")
+async def test_dbus_osagent_forces_diagnostics_off(
+    dbus_session_bus: MessageBus,
+) -> None:
+    """Test ABEDOME actively disables diagnostics after an update."""
+    os_agent = OSAgent()
+    await os_agent.connect(dbus_session_bus)
+
+    with patch.object(os_agent, "set_diagnostics", new=AsyncMock()) as set_diagnostics:
+        await os_agent.update({DBUS_ATTR_DIAGNOSTICS: True})
+
+    set_diagnostics.assert_awaited_once_with(False)
+    assert os_agent.properties[DBUS_ATTR_DIAGNOSTICS] is False
     assert os_agent.diagnostics is False
 
 

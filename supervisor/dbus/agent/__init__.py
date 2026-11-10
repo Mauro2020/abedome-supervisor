@@ -95,7 +95,7 @@ class OSAgent(DBusInterfaceProxy):
     @dbus_property
     def diagnostics(self) -> bool:
         """Return if diagnostics is enabled on OS-Agent."""
-        return self.properties[DBUS_ATTR_DIAGNOSTICS]
+        return apply_upstream_diagnostics_policy(self.properties[DBUS_ATTR_DIAGNOSTICS])
 
     @dbus_connected
     def set_diagnostics(self, value: bool) -> Awaitable[None]:
@@ -145,9 +145,10 @@ class OSAgent(DBusInterfaceProxy):
         """Update Properties."""
         await super().update(changed)
 
+        diagnostics = self.properties[DBUS_ATTR_DIAGNOSTICS]
         if (
-            self.diagnostics is True
-            and apply_upstream_diagnostics_policy(self.diagnostics) is False
+            diagnostics is True
+            and apply_upstream_diagnostics_policy(diagnostics) is False
         ):
             await self.set_diagnostics(False)
             self.properties[DBUS_ATTR_DIAGNOSTICS] = False

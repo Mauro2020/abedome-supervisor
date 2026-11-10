@@ -52,7 +52,7 @@ class _Opener:
         return _Response(item)
 
 
-def _call(opener: _Opener, tag: str = "2026.10.5") -> bool:
+def _call(opener: _Opener, tag: str = "2026.11.0") -> bool:
     return tag_exists(
         owner="Mauro2020",
         package="abedome-supervisor",
@@ -64,17 +64,17 @@ def _call(opener: _Opener, tag: str = "2026.10.5") -> bool:
 
 def test_exact_existing_tag_is_refused() -> None:
     """Refuse an exact existing tag."""
-    assert _call(_Opener([_version("2026.10.5")]))
+    assert _call(_Opener([_version("2026.11.0")]))
 
 
 def test_similar_or_missing_tag_is_available() -> None:
     """Do not confuse a similar tag with an exact match."""
-    assert not _call(_Opener([_version("2026.10.5.1")]))
+    assert not _call(_Opener([_version("2026.11.0.1")]))
 
 
 def test_all_pages_are_scanned() -> None:
     """Scan every returned page for an exact match."""
-    opener = _Opener([_version() for _ in range(100)], [_version("2026.10.5")])
+    opener = _Opener([_version() for _ in range(100)], [_version("2026.11.0")])
     assert _call(opener)
     assert len(opener.requests) == 2
 
@@ -107,10 +107,10 @@ def test_missing_token_and_invalid_tag_fail_before_network() -> None:
         tag_exists(
             owner="Mauro2020",
             package="abedome-supervisor",
-            tag="2026.10.5",
+            tag="2026.11.0",
             token="",
             opener=opener,
         )
-    assert opener.requests == []
+    assert not opener.requests
     with pytest.raises(GhcrTagCheckError, match="invalid container tag"):
         validate_tag("not a tag")

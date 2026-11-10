@@ -8,7 +8,7 @@ on:
       version:
         description: Immutable ABEDOME Supervisor version
         required: true
-        default: 2026.10.5
+        default: 2026.11.0
         type: string
 
 permissions: {}
@@ -19,7 +19,7 @@ concurrency:
 
 env:
   BASE_IMAGE: ghcr.io/home-assistant/base-python:3.14-alpine3.24-2026.10.3
-  SUPERVISOR_VERSION: "2026.10.5"
+  SUPERVISOR_VERSION: "2026.11.0"
 
 jobs:
   publish:
@@ -155,7 +155,7 @@ jobs:
           )
           from supervisor.const import SUPERVISOR_VERSION, URL_HASSIO_VERSION
 
-          assert SUPERVISOR_VERSION == "2026.10.5"
+          assert SUPERVISOR_VERSION == "2026.11.0"
           assert ABEDOME_CORE_IMAGE == "ghcr.io/mauro2020/abedome-core"
           assert ABEDOME_SUPERVISOR_IMAGE == "ghcr.io/mauro2020/abedome-supervisor"
           assert URL_HASSIO_VERSION == ABEDOME_UPDATE_FEED

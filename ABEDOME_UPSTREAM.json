@@ -1,10 +1,10 @@
 {
   "product": "ABEDOME Supervisor",
-  "version": "2026.10.5",
+  "version": "2026.11.0",
   "upstream": {
     "repository": "https://github.com/home-assistant/supervisor",
-    "commit": "fdba115f215c61f7a02c7c0567263785cfcf0034",
-    "tag": "2026.10.5"
+    "commit": "c1c6f0a754c0656eb1af189f11009f1cfc4b3e28",
+    "tag": "2026.11.0"
   },
   "runtime": {
     "core_image": "ghcr.io/mauro2020/abedome-core",

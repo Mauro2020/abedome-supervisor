@@ -30,14 +30,16 @@ def validate_update_feed_template(value: str | None) -> str:
     """Return a safe ABEDOME update-feed template or raise ``ValueError``."""
     template = ABEDOME_UPDATE_FEED if value is None else value
     parsed = urlsplit(template)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or template.count("{channel}") != 1
+    if any(
+        (
+            parsed.scheme != "https",
+            not parsed.hostname,
+            parsed.username is not None,
+            parsed.password is not None,
+            bool(parsed.query),
+            bool(parsed.fragment),
+            template.count("{channel}") != 1,
+        )
     ):
         raise ValueError(
             "SUPERVISOR_VERSION_URL must be an HTTPS URL with exactly one "

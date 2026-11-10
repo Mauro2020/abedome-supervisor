@@ -1,7 +1,7 @@
 # ABEDOME Supervisor release contract
 
-ABEDOME Supervisor 2026.10.5 is based exactly on Home Assistant Supervisor
-commit `fdba115f215c61f7a02c7c0567263785cfcf0034` (tag `2026.10.5`).
+ABEDOME Supervisor 2026.11.0 is based exactly on Home Assistant Supervisor
+commit `c1c6f0a754c0656eb1af189f11009f1cfc4b3e28` (tag `2026.11.0`).
 The product overlay is deliberately small: ABEDOME image/feed ownership,
 fail-closed privacy, and OCI branding. Home Assistant protocol identifiers are
 kept for compatibility.
@@ -39,6 +39,6 @@ Release order:
 1. publish and verify immutable ABEDOME Frontend/Core dependencies;
 2. publish the Supervisor candidate;
 3. verify the candidate digest and runtime policy;
-4. promote the exact digest to `2026.10.5`;
+4. promote the exact digest to `2026.11.0`;
 5. build and validate the signed OVA/RAUC artifacts;
 6. publish the stable feed last, using immutable versions/digests.
