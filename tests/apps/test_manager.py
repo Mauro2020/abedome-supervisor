@@ -13,7 +13,15 @@ import pytest
 from supervisor.apps.app import App
 from supervisor.arch import CpuArchManager
 from supervisor.config import CoreConfig
-from supervisor.const import ATTR_INGRESS, AppBoot, AppStartup, AppState, BusEvent
+from supervisor.const import (
+    ATTR_ACCESS_TOKEN,
+    ATTR_INGRESS,
+    AppBoot,
+    AppStartup,
+    AppState,
+    BusEvent,
+    CpuArch,
+)
 from supervisor.coresys import CoreSys
 from supervisor.docker.app import DockerApp
 from supervisor.docker.const import ContainerState
@@ -25,6 +33,7 @@ from supervisor.exceptions import (
     AppsError,
     DockerAPIError,
     DockerNotFound,
+    HassioArchNotFound,
 )
 from supervisor.plugins.dns import PluginDns
 from supervisor.resolution.const import (
@@ -230,6 +239,70 @@ async def test_app_shutdown_error(
     )
 
 
+@pytest.mark.parametrize(
+    ("state", "stopped"),
+    [
+        pytest.param(AppState.STARTED, True, id="started"),
+        pytest.param(AppState.STARTUP, True, id="startup"),
+        pytest.param(AppState.STOPPED, False, id="stopped"),
+    ],
+)
+async def test_app_shutdown_stops_running_apps(
+    coresys: CoreSys, install_app_ssh: App, state: AppState, stopped: bool
+):
+    """Test shutdown stops apps that are running, including those still starting."""
+    force_app_state(install_app_ssh, state)
+    with patch.object(DockerApp, "stop") as stop:
+        await coresys.apps.shutdown(AppStartup.APPLICATION)
+
+    assert stop.called is stopped
+
+
+async def test_app_shutdown_stops_apps_in_parallel(
+    coresys: CoreSys, install_app_ssh: App, install_app_example_image: App
+):
+    """Test apps are stopped in parallel."""
+    force_app_state(install_app_ssh, AppState.STARTED)
+    force_app_state(install_app_example_image, AppState.STARTED)
+    stopped: list[str] = []
+    both_stopping = asyncio.Barrier(2)
+
+    async def _stop(app: App) -> None:
+        async with asyncio.timeout(1):
+            await both_stopping.wait()
+        stopped.append(app.slug)
+
+    with patch.object(App, "stop", _stop):
+        await coresys.apps.shutdown(AppStartup.APPLICATION)
+
+    assert sorted(stopped) == sorted(
+        [install_app_ssh.slug, install_app_example_image.slug]
+    )
+
+
+async def test_app_shutdown_continues_after_error(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    install_app_example_image: App,
+    capture_exception: Mock,
+):
+    """Test a failing app does not keep the other apps from stopping."""
+    force_app_state(install_app_ssh, AppState.STARTED)
+    force_app_state(install_app_example_image, AppState.STARTED)
+    stopped: list[str] = []
+
+    async def _stop(app: App) -> None:
+        if app is install_app_ssh:
+            raise AppsError
+        stopped.append(app.slug)
+
+    with patch.object(App, "stop", _stop):
+        await coresys.apps.shutdown(AppStartup.APPLICATION)
+
+    assert stopped == [install_app_example_image.slug]
+    capture_exception.assert_called_once()
+
+
 @pytest.mark.usefixtures("websession")
 async def test_app_uninstall_removes_discovery(coresys: CoreSys, install_app_ssh: App):
     """Test discovery messages removed when app uninstalled."""
@@ -253,8 +326,8 @@ async def test_app_uninstall_removes_discovery(coresys: CoreSys, install_app_ssh
     ]
     assert len(delete_calls) == 1
     assert (
-        delete_calls[0].args[1]
-        == f"http://172.30.32.1:8123/api/hassio_push/discovery/{message.uuid}"
+        str(delete_calls[0].args[1])
+        == f"http://172.30.32.1/api/hassio_push/discovery/{message.uuid}"
     )
     assert delete_calls[0].kwargs["json"] == {
         "addon": TEST_ADDON_SLUG,
@@ -342,6 +415,42 @@ async def test_update(
         start_task = await coresys.apps.update(TEST_ADDON_SLUG)
 
     assert bool(start_task) is (status == "running")
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_update_uses_store_architecture(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+):
+    """Test update uses the store version's architecture list to pick the image arch."""
+    container.show.return_value["State"]["Status"] = "stopped"
+    container.show.return_value["State"]["Running"] = False
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+    with patch(
+        "supervisor.store.data.read_json_or_yaml_file",
+        return_value=load_json_fixture("app-config-add-image.json"),
+    ):
+        await coresys.store.data.update()
+
+    # Simulate an app installed when the system still supported 32-bit
+    # architectures: the installed version's arch list no longer matches
+    # any supported architecture, but the store version's does.
+    coresys.apps.data.system[TEST_ADDON_SLUG]["arch"] = ["armv7"]
+    with pytest.raises(HassioArchNotFound):
+        _ = install_app_ssh.arch
+
+    with (
+        patch.object(DockerInterface, "install") as install,
+        patch.object(DockerApp, "is_running", return_value=False),
+    ):
+        await coresys.apps.update(TEST_ADDON_SLUG)
+
+    install.assert_called_once_with(
+        AwesomeVersion("10.0.0"), "test/amd64-my-ssh-addon", False, CpuArch.AMD64
+    )
+    assert install_app_ssh.arch == CpuArch.AMD64
 
 
 @pytest.mark.parametrize("status", ["running", "stopped"])
@@ -671,3 +780,58 @@ async def test_shared_image_kept_on_update(
         await coresys.apps.update("local_example_image")
         docker.images.delete.assert_called_once_with("image_old", force=True)
         assert install_app_example_image.version == "1.3.0"
+
+
+@pytest.mark.parametrize(
+    "need_build",
+    [
+        pytest.param(False, id="image-based"),
+        pytest.param(True, id="local-build"),
+    ],
+)
+async def test_repair_installs_image_for_app_arch(
+    coresys: CoreSys, install_app_ssh: App, need_build: bool
+) -> None:
+    """Test repair reinstalls a missing image for the app's arch."""
+    with (
+        patch.object(DockerApp, "exists", new=AsyncMock(return_value=False)),
+        patch.object(DockerApp, "install", new=AsyncMock()) as install,
+        patch.object(App, "need_build", new=PropertyMock(return_value=need_build)),
+    ):
+        await coresys.apps.repair()
+
+    install.assert_called_once_with(
+        install_app_ssh.version, install_app_ssh.image, arch=CpuArch.AMD64
+    )
+
+
+async def test_repair_continues_past_unsupported_arch(
+    coresys: CoreSys, install_app_ssh: App, install_app_example: App
+) -> None:
+    """Test repair uninstalls an app without supported arch and repairs the rest."""
+    coresys.apps.data.system[install_app_ssh.slug]["arch"] = ["armv7"]
+
+    with (
+        patch.object(DockerApp, "exists", new=AsyncMock(return_value=False)),
+        patch.object(DockerApp, "install", new=AsyncMock()) as install,
+        patch.object(App, "need_build", new=PropertyMock(return_value=False)),
+        patch.object(type(coresys.apps), "uninstall", new=AsyncMock()) as uninstall,
+    ):
+        await coresys.apps.repair()
+
+    uninstall.assert_called_once_with(install_app_ssh.slug)
+    install.assert_called_once_with(
+        install_app_example.version, install_app_example.image, arch=CpuArch.AMD64
+    )
+
+
+@pytest.mark.parametrize(
+    "token", [pytest.param(None, id="none"), pytest.param("", id="empty")]
+)
+async def test_from_token_missing(
+    coresys: CoreSys, install_app_ssh: App, token: str | None
+):
+    """Test a missing or empty token matches no app."""
+    install_app_ssh.persist.pop(ATTR_ACCESS_TOKEN, None)
+
+    assert coresys.apps.from_token(token) is None

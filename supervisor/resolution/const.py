@@ -2,10 +2,16 @@
 
 from enum import StrEnum
 from pathlib import Path
+from uuid import UUID
+
+from awesomeversion import AwesomeVersion
 
 from ..const import SUPERVISOR_DATA
 
 FILE_CONFIG_RESOLUTION = Path(SUPERVISOR_DATA, "resolution.json")
+
+# Namespace of the uuids derived from issue and suggestion identities
+NAMESPACE_RESOLUTION = UUID("c822cec1-f675-44e3-a89d-55d7d46355fc")
 
 SCHEDULED_HEALTHCHECK = 3600
 
@@ -87,6 +93,7 @@ class IssueType(StrEnum):
     CORRUPT_FILESYSTEM = "corrupt_filesystem"
     DEPRECATED_APP = "deprecated_app"
     DEPRECATED_ARCH_APP = "deprecated_arch_app"
+    DEPRECATED_TCP_API_REQUEST = "deprecated_tcp_api_request"
     DETACHED_APP_MISSING = "detached_app_missing"
     DETACHED_APP_REMOVED = "detached_app_removed"
     DEVICE_ACCESS_MISSING = "device_access_missing"
@@ -134,8 +141,18 @@ class SuggestionType(StrEnum):
     EXECUTE_START = "execute_start"
     EXECUTE_STOP = "execute_stop"
     EXECUTE_UPDATE = "execute_update"
+    MOVE_LOCAL_DATA = "move_local_data"
     REGISTRY_LOGIN = "registry_login"
     RENAME_DATA_DISK = "rename_data_disk"
+
+
+# Suggestions the Home Assistant frontend can only present from a given Core
+# version on (the fix flow translations ship with Core). Suggestions below
+# their minimum version are filtered from Core-facing API responses and
+# events; all other API consumers always see them.
+SUGGESTION_MIN_CORE_VERSION: dict[SuggestionType, AwesomeVersion] = {
+    SuggestionType.MOVE_LOCAL_DATA: AwesomeVersion("2026.9.0b0"),
+}
 
 
 # Maps legacy check slugs to current slugs.

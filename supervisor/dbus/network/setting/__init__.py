@@ -7,9 +7,9 @@ from typing import Any
 from dbus_fast import Variant
 from dbus_fast.aio.message_bus import MessageBus
 
-from ...const import DBUS_NAME_NM, MulticastDnsValue
+from ...const import DBUS_NAME_NM, ConnectionFlags, MulticastDnsValue
 from ...interface import DBusInterface
-from ...utils import dbus_connected
+from ...utils import dbus_connected, dbus_signal_callback
 from ..configuration import (
     ConnectionProperties,
     EthernetProperties,
@@ -30,6 +30,7 @@ CONF_ATTR_802_WIRELESS_SECURITY = "802-11-wireless-security"
 CONF_ATTR_VLAN = "vlan"
 CONF_ATTR_IPV4 = "ipv4"
 CONF_ATTR_IPV6 = "ipv6"
+CONF_ATTR_USER = "user"
 
 CONF_ATTR_CONNECTION_ID = "id"
 CONF_ATTR_CONNECTION_UUID = "uuid"
@@ -41,6 +42,14 @@ CONF_ATTR_CONNECTION_INTERFACE_NAME = "interface-name"
 
 CONF_ATTR_MATCH_PATH = "path"
 
+CONF_ATTR_USER_DATA = "data"
+
+# Set by a tool that writes a profile for the Supervisor to take over, such as
+# the Home Assistant installer through a CONFIG folder
+IMPORT_MARKER_KEY = "io.home-assistant.import"
+IMPORT_MARKER_VALUE = "supervisor"
+
+CONF_ATTR_VLAN_FLAGS = "flags"
 CONF_ATTR_VLAN_ID = "id"
 CONF_ATTR_VLAN_PARENT = "parent"
 
@@ -85,16 +94,28 @@ def _merge_settings_attribute(
     *,
     ignore_current_value: list[str] | None = None,
 ) -> None:
-    """Merge settings attribute if present."""
-    if attribute in new_settings:
-        if attribute in base_settings:
-            if ignore_current_value:
-                for field in ignore_current_value:
-                    base_settings[attribute].pop(field, None)
+    """Merge settings attribute if present.
 
-            base_settings[attribute].update(new_settings[attribute])
-        else:
-            base_settings[attribute] = new_settings[attribute]
+    An empty dict for `attribute` in `new_settings` explicitly removes it
+    from `base_settings` instead of being merged in as a no-op, letting a
+    caller clear an entire section it doesn't otherwise own (e.g. wireless
+    security when switching an interface to open auth).
+    """
+    if attribute not in new_settings:
+        return
+
+    if not new_settings[attribute]:
+        base_settings.pop(attribute, None)
+        return
+
+    if attribute in base_settings:
+        if ignore_current_value:
+            for field in ignore_current_value:
+                base_settings[attribute].pop(field, None)
+
+        base_settings[attribute].update(new_settings[attribute])
+    else:
+        base_settings[attribute] = new_settings[attribute]
 
 
 class NetworkSetting(DBusInterface):
@@ -117,6 +138,8 @@ class NetworkSetting(DBusInterface):
         self._ipv4: Ip4Properties | None = None
         self._ipv6: Ip6Properties | None = None
         self._match: MatchProperties | None = None
+        self._user_data: dict[str, str] | None = None
+        self._flags: ConnectionFlags = ConnectionFlags.NONE
         super().__init__()
 
     @property
@@ -164,6 +187,28 @@ class NetworkSetting(DBusInterface):
         """Return match properties if any."""
         return self._match
 
+    @property
+    def user_data(self) -> dict[str, str] | None:
+        """Return user data if any."""
+        return self._user_data
+
+    @property
+    def flags(self) -> ConnectionFlags:
+        """Return connection profile flags."""
+        return self._flags
+
+    @property
+    def is_generated(self) -> bool:
+        """Return true if NetworkManager generated this profile itself.
+
+        Such a profile (e.g. the in-memory "Wired connection 1" auto-default
+        on a device without a stored profile) is a fallback, not a stored
+        configuration, so it is nobody's profile for ownership purposes.
+        """
+        return bool(
+            self._flags & (ConnectionFlags.NM_GENERATED | ConnectionFlags.VOLATILE)
+        )
+
     @dbus_connected
     async def get_settings(self) -> dict[str, Any]:
         """Return connection settings."""
@@ -209,6 +254,7 @@ class NetworkSetting(DBusInterface):
             ignore_current_value=_IP_IGNORE_FIELDS,
         )
         _merge_settings_attribute(new_settings, settings, CONF_ATTR_MATCH)
+        _merge_settings_attribute(new_settings, settings, CONF_ATTR_USER)
 
         await self.connected_dbus.Settings.Connection.call("update", new_settings)
 
@@ -232,12 +278,31 @@ class NetworkSetting(DBusInterface):
         await super().connect(bus)
         await self.reload()
 
-        self.connected_dbus.Settings.Connection.on("updated", self.reload)
+        self.connected_dbus.Settings.Connection.on("updated", self._on_updated)
+
+    @dbus_signal_callback
+    async def _on_updated(self) -> None:
+        """Reload settings on the updated signal."""
+        await self.reload()
 
     @dbus_connected
     async def reload(self):
         """Get current settings for connection."""
         data = await self.get_settings()
+        self._flags = ConnectionFlags(
+            await self.connected_dbus.Settings.Connection.get("flags")
+        )
+
+        # Sections NetworkManager no longer reports must not keep stale values
+        self._connection = None
+        self._wireless = None
+        self._wireless_security = None
+        self._ethernet = None
+        self._vlan = None
+        self._ipv4 = None
+        self._ipv6 = None
+        self._match = None
+        self._user_data = None
 
         # Get configuration settings we care about
         # See: https://networkmanager.dev/docs/api/latest/nm-settings-dbus.html
@@ -255,6 +320,9 @@ class NetworkSetting(DBusInterface):
                 llmnr=data[CONF_ATTR_CONNECTION].get(
                     CONF_ATTR_CONNECTION_LLMNR, MulticastDnsValue.DEFAULT.value
                 ),
+                autoconnect=data[CONF_ATTR_CONNECTION].get(
+                    CONF_ATTR_CONNECTION_AUTOCONNECT, True
+                ),
             )
 
         if CONF_ATTR_802_ETHERNET in data:
@@ -268,7 +336,7 @@ class NetworkSetting(DBusInterface):
             self._wireless = WirelessProperties(
                 ssid=bytes(
                     data[CONF_ATTR_802_WIRELESS].get(CONF_ATTR_802_WIRELESS_SSID, [])
-                ).decode(),
+                ),
                 assigned_mac=data[CONF_ATTR_802_WIRELESS].get(
                     CONF_ATTR_802_WIRELESS_ASSIGNED_MAC
                 ),
@@ -298,7 +366,6 @@ class NetworkSetting(DBusInterface):
                     parent=data[CONF_ATTR_VLAN].get(CONF_ATTR_VLAN_PARENT),
                 )
             else:
-                self._vlan = None
                 _LOGGER.warning(
                     "Network settings for vlan connection %s missing required vlan id, cannot process it",
                     self.connection.interface_name,
@@ -334,3 +401,59 @@ class NetworkSetting(DBusInterface):
             self._match = MatchProperties(
                 data[CONF_ATTR_MATCH].get(CONF_ATTR_MATCH_PATH)
             )
+
+        if CONF_ATTR_USER in data:
+            self._user_data = data[CONF_ATTR_USER].get(CONF_ATTR_USER_DATA)
+
+
+def connection_is_marked_for_import(setting: NetworkSetting) -> bool:
+    """Return true if setting is marked for the Supervisor to take over."""
+    return (setting.user_data or {}).get(IMPORT_MARKER_KEY) == IMPORT_MARKER_VALUE
+
+
+def get_import_settings(
+    setting: NetworkSetting, *, interface_name: str, path: str
+) -> dict[str, dict[str, Variant]]:
+    """Return the update that turns a marked profile into the device's own.
+
+    It binds the profile to the device and names it like
+    `get_connection_from_interface()` does, without the marker.
+    """
+    connection = {CONF_ATTR_CONNECTION_ID: Variant("s", f"Supervisor {interface_name}")}
+    settings: dict[str, dict[str, Variant]] = {CONF_ATTR_CONNECTION: connection}
+    if path:
+        settings[CONF_ATTR_MATCH] = {CONF_ATTR_MATCH_PATH: Variant("as", [path])}
+    else:
+        connection[CONF_ATTR_CONNECTION_INTERFACE_NAME] = Variant("s", interface_name)
+
+    # An empty section removes it (see `_merge_settings_attribute()`)
+    user_data = {
+        key: value
+        for key, value in (setting.user_data or {}).items()
+        if key != IMPORT_MARKER_KEY
+    }
+    settings[CONF_ATTR_USER] = (
+        {CONF_ATTR_USER_DATA: Variant("a{ss}", user_data)} if user_data else {}
+    )
+    return settings
+
+
+def connection_matches_device(
+    setting: NetworkSetting, *, interface_name: str, path: str
+) -> bool:
+    """Return true if setting's match/interface-name identifies the given device.
+
+    Only covers the plain ethernet/wireless identity check (match by udev
+    path, falling back to interface name) shared between
+    `Interface.equals_dbus_interface()` and the stored-connection enumeration
+    lookup in `NetworkManager.find_connection_settings()`. VLAN matching (by
+    id/parent) and device-type compatibility are intentionally not part of
+    this helper, they stay call-site specific.
+    """
+    if setting.match and setting.match.path:
+        return setting.match.path == [path]
+
+    return (
+        setting.connection is not None
+        and setting.connection.interface_name == interface_name
+    )

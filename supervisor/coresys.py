@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio import sleep as _sleep
 from collections.abc import Callable, Coroutine
 from contextvars import Context, copy_context
 from datetime import UTC, datetime, tzinfo
@@ -25,6 +26,7 @@ from .const import (
     MACHINE_ID,
     SERVER_SOFTWARE,
     VALID_API_STATES,
+    WEBSESSION_MAX_HEADER_SIZE,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +61,8 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+BLOCK_LOG_INTERVAL = 5
 
 
 class CoreSys:
@@ -107,6 +111,8 @@ class CoreSys:
 
         # Task factory attributes
         self._set_task_context: list[Callable[[Context], Context]] = []
+        self._active_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def load_config(self) -> Self:
         """Load config in executor."""
@@ -152,6 +158,8 @@ class CoreSys:
         session = aiohttp.ClientSession(
             headers=MappingProxyType({aiohttp.hdrs.USER_AGENT: SERVER_SOFTWARE}),
             connector=connector,
+            max_line_size=WEBSESSION_MAX_HEADER_SIZE,
+            max_field_size=WEBSESSION_MAX_HEADER_SIZE,
         )
 
         self._websession = session
@@ -613,7 +621,8 @@ class CoreSys:
     ) -> None:
         """Add callback used to modify context prior to creating a task.
 
-        Only used for tasks created via CoreSys.create_task. Callback can modify the provided
+        Only used for tasks created via CoreSys.create_task, CoreSys.create_background_task,
+        CoreSys.call_later and CoreSys.call_at. Callback can modify the provided
         context using context.run (ex. `context.run(var.set, "new_value")`). Callback should
         return the context to be provided to task.
         """
@@ -635,15 +644,70 @@ class CoreSys:
             context = callback(context)
         return context
 
-    def create_task(
-        self, coroutine: Coroutine, *, eager_start: bool | None = None
+    def _track_task(
+        self,
+        coroutine: Coroutine,
+        tracked: set[asyncio.Task],
+        eager_start: bool | None,
     ) -> asyncio.Task:
-        """Create an async task."""
-        return self.loop.create_task(
+        """Create a task and hold a reference to it until it is done.
+
+        The event loop only keeps weak references to tasks, so an unreferenced
+        task can be garbage collected before it finishes.
+        """
+        task = self.loop.create_task(
             coroutine,
             context=self._create_context(),
             eager_start=eager_start,
         )
+        # An eagerly started task may already be done
+        if not task.done():
+            tracked.add(task)
+            task.add_done_callback(tracked.discard)
+        return task
+
+    def create_task(
+        self, coroutine: Coroutine, *, eager_start: bool | None = None
+    ) -> asyncio.Task:
+        """Create an async task.
+
+        Use create_background_task instead if the task runs for the lifetime of
+        Supervisor or a component, or waits on something that may never happen.
+        """
+        return self._track_task(coroutine, self._active_tasks, eager_start)
+
+    def create_background_task(
+        self, coroutine: Coroutine, *, eager_start: bool | None = None
+    ) -> asyncio.Task:
+        """Create an async task that is long-lived.
+
+        block_till_done does not wait for these unless asked to.
+        """
+        return self._track_task(coroutine, self._background_tasks, eager_start)
+
+    async def block_till_done(self, wait_background_tasks: bool = False) -> None:
+        """Wait until all tasks are done, including tasks created while waiting.
+
+        Used by tests. Skips the calling task and tasks being cancelled, but not
+        tasks awaiting the caller, so calling it from a task another tracked
+        task awaits deadlocks. Callbacks scheduled with call_later or call_at
+        are not waited for until they run and create a task.
+        """
+        # Bound at import so tests patching asyncio.sleep cannot stop this yielding
+        await _sleep(0)
+        current_task = asyncio.current_task()
+        while tasks := [
+            task
+            for task in (
+                self._active_tasks | self._background_tasks
+                if wait_background_tasks
+                else self._active_tasks
+            )
+            if task is not current_task and not task.cancelling()
+        ]:
+            _, pending = await asyncio.wait(tasks, timeout=BLOCK_LOG_INTERVAL)
+            for task in pending:
+                _LOGGER.warning("Still waiting for task: %s", task)
 
     def call_later(
         self,
@@ -689,6 +753,11 @@ class CoreSysAttributes:
     def sys_timezone(self) -> str:
         """Return system internal used timezone."""
         return self.coresys.timezone
+
+    @property
+    def sys_timezone_tzinfo(self) -> tzinfo:
+        """Return system internal used timezone as tzinfo object."""
+        return self.coresys.timezone_tzinfo
 
     @property
     def sys_machine(self) -> str | None:
@@ -865,6 +934,12 @@ class CoreSysAttributes:
     ) -> asyncio.Task:
         """Create an async task."""
         return self.coresys.create_task(coroutine, eager_start=eager_start)
+
+    def sys_create_background_task(
+        self, coroutine: Coroutine, *, eager_start: bool | None = None
+    ) -> asyncio.Task:
+        """Create an async task that is long-lived."""
+        return self.coresys.create_background_task(coroutine, eager_start=eager_start)
 
     def sys_call_later(
         self,

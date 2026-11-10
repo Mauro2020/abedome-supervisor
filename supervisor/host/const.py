@@ -2,9 +2,16 @@
 
 from enum import StrEnum
 
+from awesomeversion import AwesomeVersion
+
 PARAM_BOOT_ID = "_BOOT_ID"
 PARAM_FOLLOW = "follow"
 PARAM_SYSLOG_IDENTIFIER = "SYSLOG_IDENTIFIER"
+
+# Writing NTP settings needs the timesyncd drop-in support of this OS Agent
+# release. Older agents write /etc/systemd/timesyncd.conf and fail on the
+# read-only /etc. HAOS 18.3.dev20260830 is the first build shipping it.
+NTP_MIN_OS_AGENT_VERSION = AwesomeVersion("1.13.0")
 
 
 class InterfaceMethod(StrEnum):
@@ -47,6 +54,11 @@ class AuthMethod(StrEnum):
     OPEN = "open"
     WEP = "wep"
     WPA_PSK = "wpa-psk"
+    # A stored profile's auth method that Supervisor doesn't (yet) understand
+    # (e.g. WPA3/sae, wpa-eap, owe). Reported on GET so the profile and its
+    # observed state (SSID/signal) stay visible, but never accepted on write
+    # - see `_map_nm_wifi()` and `_validate_wifi_config_v2()`.
+    UNSUPPORTED = "unsupported"
 
 
 class WifiMode(StrEnum):
@@ -67,6 +79,7 @@ class HostFeature(StrEnum):
     JOURNAL = "journal"
     MOUNT = "mount"
     NETWORK = "network"
+    NTP = "ntp"
     OS_AGENT = "os_agent"
     REBOOT = "reboot"
     RESOLVED = "resolved"
@@ -88,6 +101,7 @@ class LogFormatter(StrEnum):
     """Log formatter."""
 
     PLAIN = "plain"
+    TIMESTAMP = "timestamp"
     VERBOSE = "verbose"
 
 

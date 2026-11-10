@@ -3,7 +3,6 @@
 import asyncio
 from collections.abc import Awaitable
 from contextlib import suppress
-from dataclasses import replace
 import logging
 from typing import Self, Union
 
@@ -23,6 +22,7 @@ from ..exceptions import (
     AppsJobError,
     CoreDNSError,
     DockerError,
+    HassioArchNotFound,
     HassioError,
 )
 from ..jobs import ChildJobSyncFilter
@@ -87,8 +87,10 @@ class AppManager(CoreSysAttributes):
         """Return an installed app from slug."""
         return self.local.get(app_slug)
 
-    def from_token(self, token: str) -> App | None:
+    def from_token(self, token: str | None) -> App | None:
         """Return an app from Supervisor token."""
+        if not token:
+            return None
         for app in self.installed:
             if token == app.supervisor_token:
                 return app
@@ -155,7 +157,7 @@ class AppManager(CoreSysAttributes):
                     wait_boot.append(start_task)
             except HassioError:
                 self.sys_resolution.add_issue(
-                    replace(app.boot_failed_issue),
+                    app.boot_failed_issue,
                     suggestions=[
                         SuggestionType.EXECUTE_START,
                         SuggestionType.DISABLE_BOOT,
@@ -175,7 +177,7 @@ class AppManager(CoreSysAttributes):
         for app in tasks:
             if app.state in {AppState.ERROR, AppState.UNKNOWN}:
                 self.sys_resolution.add_issue(
-                    replace(app.boot_failed_issue),
+                    app.boot_failed_issue,
                     suggestions=[
                         SuggestionType.EXECUTE_START,
                         SuggestionType.DISABLE_BOOT,
@@ -186,7 +188,10 @@ class AppManager(CoreSysAttributes):
         """Shutdown apps."""
         tasks: list[App] = []
         for app in self.installed:
-            if app.state != AppState.STARTED or app.startup != stage:
+            if (
+                app.state not in (AppState.STARTED, AppState.STARTUP)
+                or app.startup != stage
+            ):
                 continue
             tasks.append(app)
 
@@ -195,14 +200,17 @@ class AppManager(CoreSysAttributes):
         if not tasks:
             return
 
-        # Stop Apps sequential
-        # avoid issue on slow IO
-        for app in tasks:
-            try:
-                await app.stop()
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.warning("Can't stop app %s: %s", app.slug, err)
-                await async_capture_exception(err)
+        # Stop apps in parallel, the stage is then bounded by the slowest app
+        # instead of the sum of all shutdown grace periods
+        await asyncio.gather(*(self._shutdown_app(app) for app in tasks))
+
+    async def _shutdown_app(self, app: App) -> None:
+        """Stop an app during shutdown, capturing errors to stop the others."""
+        try:
+            await app.stop()
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Can't stop app %s: %s", app.slug, err)
+            await async_capture_exception(err)
 
     @Job(
         name="app_manager_install",
@@ -404,10 +412,10 @@ class AppManager(CoreSysAttributes):
 
         for app in needs_repair:
             _LOGGER.info("Repairing for app: %s", app.slug)
-            with suppress(DockerError, KeyError):
+            with suppress(DockerError, KeyError, HassioArchNotFound):
                 # Need pull a image again
                 if not app.need_build:
-                    await app.instance.install(app.version, app.image)
+                    await app.instance.install(app.version, app.image, arch=app.arch)
                     continue
 
                 # Need local lookup
@@ -415,7 +423,9 @@ class AppManager(CoreSysAttributes):
                     store = self.store[app.slug]
                     # If this app is available for rebuild
                     if app.version == store.version:
-                        await app.instance.install(app.version, app.image)
+                        await app.instance.install(
+                            app.version, app.image, arch=app.arch
+                        )
                         continue
 
             _LOGGER.error("Can't repair %s", app.slug)

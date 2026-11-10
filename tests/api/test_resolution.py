@@ -2,9 +2,10 @@
 
 import asyncio
 from http import HTTPStatus
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from aiohttp.test_utils import TestClient
+from awesomeversion import AwesomeVersion
 import pytest
 
 from supervisor.const import (
@@ -16,7 +17,7 @@ from supervisor.const import (
     FeatureFlag,
 )
 from supervisor.coresys import CoreSys
-from supervisor.exceptions import ResolutionError
+from supervisor.exceptions import MountActivationError, ResolutionError
 from supervisor.homeassistant.const import WSType
 from supervisor.resolution.const import (
     ContextType,
@@ -92,6 +93,76 @@ async def test_api_resolution_apply_suggestion(
 
     with pytest.raises(ResolutionError):
         await coresys.resolution.apply_suggestion(clear_backup)
+
+
+async def test_api_resolution_apply_suggestion_fixup_error(
+    coresys: CoreSys, api_client_with_prefix: tuple[TestClient, str]
+):
+    """Test a failing fixup surfaces as API error and keeps issue and suggestion."""
+    api_client, prefix = api_client_with_prefix
+    coresys.resolution.add_issue(
+        issue := Issue(IssueType.MOUNT_FAILED, ContextType.MOUNT, reference="test"),
+        suggestions=[SuggestionType.EXECUTE_RELOAD],
+    )
+    suggestion = coresys.resolution.suggestions[-1]
+
+    with patch(
+        "supervisor.resolution.fixups.mount_execute_reload.FixupMountExecuteReload.process_fixup",
+        side_effect=MountActivationError(name="test"),
+    ):
+        resp = await api_client.post(
+            f"{prefix}/resolution/suggestion/{suggestion.uuid}"
+        )
+
+    assert resp.status == 400
+    body = await resp.json()
+    assert (
+        body["message"]
+        == "Mount test is not reachable. Check the Supervisor logs for details"
+    )
+    assert body["error_key"] == "mount_activation_error"
+
+    assert issue in coresys.resolution.issues
+    assert suggestion in coresys.resolution.suggestions
+
+
+async def test_api_resolution_suggestions_filtered_for_old_core(
+    coresys: CoreSys, api_client_with_prefix: tuple[TestClient, str]
+):
+    """Test v1 responses hide suggestions the Core version cannot present.
+
+    The v2 API never filters: no Core version predating the suggestion
+    filtering in its repair flow supports v2.
+    """
+    api_client, prefix = api_client_with_prefix
+    coresys.resolution.add_issue(
+        issue := Issue(IssueType.MOUNT_FAILED, ContextType.MOUNT, reference="test"),
+        suggestions=[SuggestionType.MOVE_LOCAL_DATA, SuggestionType.EXECUTE_RELOAD],
+    )
+
+    all_types = {"execute_reload", "move_local_data"}
+    for version, expected_types in [
+        (AwesomeVersion("2026.8.3"), {"execute_reload"} if not prefix else all_types),
+        (AwesomeVersion("2026.9.0b0"), all_types),
+    ]:
+        with patch.object(
+            type(coresys.homeassistant),
+            "version",
+            new=PropertyMock(return_value=version),
+        ):
+            resp = await api_client.get(f"{prefix}/resolution/info")
+            body = await resp.json()
+            assert {
+                suggestion["type"] for suggestion in body["data"]["suggestions"]
+            } == expected_types
+
+            resp = await api_client.get(
+                f"{prefix}/resolution/issue/{issue.uuid}/suggestions"
+            )
+            body = await resp.json()
+            assert {
+                suggestion["type"] for suggestion in body["data"]["suggestions"]
+            } == expected_types
 
 
 async def test_api_resolution_dismiss_issue(

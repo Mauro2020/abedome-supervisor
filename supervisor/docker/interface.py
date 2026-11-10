@@ -56,7 +56,12 @@ from .manager import CommandReturn, ExecReturn, PullLogEntry
 from .monitor import DockerContainerStateEvent
 from .pull_progress import ImagePullProgress
 from .stats import DockerStats
-from .utils import get_registry_from_image
+from .utils import (
+    get_registry_from_image,
+    is_corrupt_container_error,
+    split_docker_domain,
+    split_image_tag,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -91,14 +96,15 @@ def _container_state_from_model(
 
     state_obj = container_metadata["State"]
     if state_obj["Status"] == "running":
-        if "Health" in state_obj:
-            return (
-                ContainerState.HEALTHY
-                if state_obj["Health"]["Status"] == "healthy"
-                else ContainerState.UNHEALTHY,
-                None,
-            )
-        return ContainerState.RUNNING, None
+        match state_obj.get("Health", {}).get("Status"):
+            case "healthy":
+                return ContainerState.HEALTHY, None
+            case "unhealthy":
+                return ContainerState.UNHEALTHY, None
+            case "starting":
+                return ContainerState.STARTING, None
+            case _:
+                return ContainerState.RUNNING, None
 
     exit_code = state_obj["ExitCode"]
     if exit_code > 0:
@@ -167,7 +173,7 @@ class DockerInterface(JobGroup, ABC):
     def image(self) -> str | None:
         """Return name of Docker image."""
         try:
-            return self.meta_config["Image"].partition(":")[0]
+            return split_image_tag(self.meta_config["Image"])[0]
         except KeyError:
             return None
 
@@ -227,9 +233,11 @@ class DockerInterface(JobGroup, ABC):
             # prefix (e.g. "homeassistant/foo" instead of "docker.io/homeassistant/foo").
             # aiodocker derives ServerAddress from image.partition("/"), so without
             # the prefix it would use the namespace ("homeassistant") as ServerAddress,
-            # which Docker's containerd resolver rejects as a host mismatch.
+            # which Docker's containerd resolver rejects as a host mismatch. Qualify
+            # the remainder so an image which already carries a Docker Hub domain
+            # does not end up with a doubled prefix.
             if registry in (DOCKER_HUB, DOCKER_HUB_LEGACY):
-                qualified_image = f"{DOCKER_HUB}/{image}"
+                qualified_image = f"{DOCKER_HUB}/{split_docker_domain(image)[1]}"
 
             _LOGGER.info(
                 "Using stored registry credentials for %s (user: %s) to pull %s",
@@ -411,14 +419,29 @@ class DockerInterface(JobGroup, ABC):
     async def _get_container(self) -> dict[str, Any] | None:
         """Get docker container, returns None if not found."""
         try:
-            container = await self.sys_docker.containers.get(self.name)
-            return await container.show()
+            # container() builds the handle from the name with no I/O;
+            # show() below performs the actual inspect call.
+            return await self.sys_docker.containers.container(self.name).show()
         except TimeoutError as err:
             raise DockerTimeoutError(
                 f"Timeout occurred while getting container information for {self.name}"
             ) from err
         except aiodocker.DockerError as err:
             if err.status == HTTPStatus.NOT_FOUND:
+                return None
+            if is_corrupt_container_error(err):
+                # The container's RW layer failed to load when the daemon
+                # restored its state, leaving the record unusable for this
+                # daemon's lifetime. Report it as missing: since Supervisor
+                # can recreate any of its containers, recovery paths then
+                # recreate this one, removing the broken record along the way
+                # in the job-locked stop/start paths.
+                _LOGGER.warning(
+                    "Container %s storage metadata is corrupt, "
+                    "treating the container as missing: %s",
+                    self.name,
+                    err,
+                )
                 return None
             raise DockerAPIError(
                 f"Docker API error occurred while getting container information: {err!s}"
@@ -449,7 +472,9 @@ class DockerInterface(JobGroup, ABC):
         """Attach to running Docker container."""
         with suppress(aiodocker.DockerError, TimeoutError):
             if docker_container is DEFAULT:
-                docker_container = await self.sys_docker.containers.get(self.name)
+                # container() builds the handle from the name with no I/O;
+                # show() below performs the actual inspect call.
+                docker_container = self.sys_docker.containers.container(self.name)
             if isinstance(docker_container, DockerContainer):
                 self._meta = await docker_container.show()
                 self.sys_docker.monitor.watch_container(self._meta)
@@ -465,7 +490,7 @@ class DockerInterface(JobGroup, ABC):
                         DockerContainerStateEvent(
                             self.name,
                             state,
-                            docker_container.id,
+                            self._meta["Id"],
                             int(time()),
                             exit_code,
                         ),
@@ -694,9 +719,9 @@ class DockerInterface(JobGroup, ABC):
         """Create a temporary container and run command."""
         raise NotImplementedError
 
-    async def stats(self) -> DockerStats:
+    async def stats(self, *, one_shot: bool = False) -> DockerStats:
         """Read and return stats from container."""
-        stats = await self.sys_docker.container_stats(self.name)
+        stats = await self.sys_docker.container_stats(self.name, one_shot=one_shot)
         return DockerStats(stats)
 
     async def is_failed(self) -> bool:
@@ -711,7 +736,9 @@ class DockerInterface(JobGroup, ABC):
                 filters={"reference": [self.image]}
             ):
                 for tag in image["RepoTags"]:
-                    version = AwesomeVersion(tag.partition(":")[2])
+                    if (image_tag := split_image_tag(tag)[1]) is None:
+                        continue
+                    version = AwesomeVersion(image_tag)
                     if version.strategy == AwesomeVersionStrategy.UNKNOWN:
                         continue
                     available_version.append(version)

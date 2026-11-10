@@ -7,8 +7,15 @@ from pathlib import Path
 import subprocess
 from typing import TYPE_CHECKING
 
-from ..const import ROLE_ADMIN, ROLE_MANAGER, SECURITY_DISABLE, SECURITY_PROFILE
+from ..const import (
+    ATTR_PORTS,
+    ROLE_ADMIN,
+    ROLE_MANAGER,
+    SECURITY_DISABLE,
+    SECURITY_PROFILE,
+)
 from ..docker.const import Capabilities
+from ..utils import clean_env
 
 if TYPE_CHECKING:
     from .model import AppModel
@@ -32,6 +39,10 @@ def rating_security(app: AppModel) -> int:
 
     # Home Assistant Login & Ingress
     if app.with_ingress:
+        rating += 2
+    elif not app.host_network and not any(
+        port is not None for port in (app.data.get(ATTR_PORTS) or {}).values()
+    ):
         rating += 2
     elif app.access_auth_api:
         rating += 1
@@ -93,7 +104,12 @@ def remove_data(folder: Path) -> None:
     """
     try:
         subprocess.run(
-            ["rm", "-rf", str(folder)], stdout=subprocess.DEVNULL, text=True, check=True
+            ["rm", "-rf", str(folder)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=clean_env(),
+            text=True,
+            check=True,
         )
     except OSError as err:
         error_msg = str(err)

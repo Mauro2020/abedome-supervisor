@@ -1,13 +1,15 @@
 """Test auth API."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from aiohttp.hdrs import WWW_AUTHENTICATE
 from aiohttp.test_utils import TestClient
 import pytest
 
 from supervisor.apps.app import App
+from supervisor.auth import LoginResult
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import HomeAssistantAPIError, HomeAssistantWSError
 from supervisor.homeassistant.api import HomeAssistantAPI
@@ -150,6 +152,37 @@ async def test_failed_password_reset(
     assert expected_log in caplog.text
 
 
+async def test_password_reset_supervisor_rejected_by_core(
+    api_client_with_prefix: tuple[TestClient, str],
+    coresys: CoreSys,
+    websession: MagicMock,
+):
+    """Test password reset when Core rejects the Supervisor's own credentials."""
+    api_client, prefix = api_client_with_prefix
+    websession.request = MagicMock(return_value=MockResponse(status=401))
+
+    with (
+        patch.object(type(coresys.homeassistant.api), "use_unix_socket", True),
+        patch.object(
+            type(coresys.homeassistant.api),
+            "session",
+            new_callable=PropertyMock,
+            return_value=websession,
+        ),
+    ):
+        resp = await api_client.post(
+            f"{prefix}/auth/reset", json={"username": "john", "password": "doe"}
+        )
+
+    assert resp.status == 500
+    body = await resp.json()
+    assert body["error_key"] == "home_assistant_auth_error"
+    assert body["message"] == (
+        "Supervisor could not authenticate with Home Assistant. "
+        "Check Supervisor logs for details"
+    )
+
+
 async def test_list_users(
     api_client_with_prefix: tuple[TestClient, str],
     coresys: CoreSys,
@@ -206,9 +239,11 @@ async def test_auth_json_success(
     field: str,
 ):
     """Test successful JSON auth."""
-    mock_check_login.return_value = True
+    mock_check_login.return_value = LoginResult(group_ids=["system-users"])
     resp = await api_client.post("/auth", json={field: "test", "password": "pass"})
     assert resp.status == 200
+    body = await resp.json()
+    assert body["data"] == {"group_ids": ["system-users"]}
 
 
 @pytest.mark.parametrize(
@@ -227,7 +262,7 @@ async def test_auth_json_failure_none(
     password: str | None,
 ):
     """Test failed JSON auth with none user or password."""
-    mock_check_login.return_value = True
+    mock_check_login.return_value = LoginResult(group_ids=["system-users"])
     resp = await api_client.post("/auth", json={"username": user, "password": password})
     assert resp.status == 401
     assert (
@@ -244,12 +279,58 @@ async def test_auth_json_invalid_credentials(
     api_client: TestClient, mock_check_login: AsyncMock, install_app_ssh: App
 ):
     """Test failed JSON auth due to invalid credentials."""
-    mock_check_login.return_value = False
+    mock_check_login.return_value = None
     resp = await api_client.post(
         "/auth", json={"username": "test", "password": "wrong"}
     )
     assert WWW_AUTHENTICATE not in resp.headers
     assert resp.status == 401
+
+
+@pytest.mark.parametrize("api_client", [TEST_ADDON_SLUG], indirect=True)
+async def test_auth_supervisor_rejected_by_core(
+    api_client: TestClient,
+    coresys: CoreSys,
+    websession: MagicMock,
+    install_app_ssh: App,
+):
+    """Test app login when Core rejects the Supervisor's own credentials.
+
+    The app user's credentials were never checked, so a cached login must
+    survive and a fresh login must report the Supervisor-side failure.
+    """
+    websession.request = MagicMock(return_value=MockResponse(status=401))
+
+    with (
+        patch.object(type(coresys.homeassistant.api), "use_unix_socket", True),
+        patch.object(
+            type(coresys.homeassistant.api),
+            "session",
+            new_callable=PropertyMock,
+            return_value=websession,
+        ),
+        patch.object(coresys.homeassistant.api, "check_api_state", return_value=True),
+    ):
+        resp = await api_client.post(
+            "/auth", json={"username": "test", "password": "pass"}
+        )
+        assert resp.status == 500
+        body = await resp.json()
+        assert body["error_key"] == "home_assistant_auth_error"
+
+        # pylint: disable-next=protected-access
+        await coresys.auth._update_cache("test", "pass", ["system-users"])
+        resp = await api_client.post(
+            "/auth", json={"username": "test", "password": "pass"}
+        )
+        assert resp.status == 200
+        # Wait for the background re-validation to run into the 401
+        # pylint: disable-next=protected-access
+        if task := coresys.auth._running.get("test"):
+            await asyncio.wait_for(task, 1)
+        assert websession.request.call_count == 2
+        # pylint: disable-next=protected-access
+        assert coresys.auth._check_cache("test", "pass") is not None
 
 
 @pytest.mark.parametrize("api_client", [TEST_ADDON_SLUG], indirect=True)
@@ -275,7 +356,7 @@ async def test_auth_urlencoded_success(
     api_client: TestClient, mock_check_login: AsyncMock, install_app_ssh: App
 ):
     """Test successful URL-encoded auth."""
-    mock_check_login.return_value = True
+    mock_check_login.return_value = LoginResult(group_ids=["system-users"])
     resp = await api_client.post(
         "/auth",
         data="username=test&password=pass",
@@ -289,7 +370,7 @@ async def test_auth_urlencoded_failure(
     api_client: TestClient, mock_check_login: AsyncMock, install_app_ssh: App
 ):
     """Test URL-encoded auth with invalid credentials."""
-    mock_check_login.return_value = False
+    mock_check_login.return_value = None
     resp = await api_client.post(
         "/auth",
         data="username=test&password=fail",
@@ -316,7 +397,7 @@ async def test_auth_basic_auth(
     api_client: TestClient, mock_check_login: AsyncMock, install_app_ssh: App
 ):
     """Test auth with BasicAuth header."""
-    mock_check_login.return_value = True
+    mock_check_login.return_value = LoginResult(group_ids=["system-users"])
     resp = await api_client.post(
         "/auth", headers={"Authorization": "Basic dGVzdDpwYXNz"}
     )
@@ -328,7 +409,7 @@ async def test_auth_basic_auth_failure(
     api_client: TestClient, mock_check_login: AsyncMock, install_app_ssh: App
 ):
     """Test auth with BasicAuth header and failure."""
-    mock_check_login.return_value = False
+    mock_check_login.return_value = None
     resp = await api_client.post(
         "/auth", headers={"Authorization": "Basic dGVzdDpwYXNz"}
     )
@@ -345,6 +426,68 @@ async def test_auth_bearer_token_returns_401(
     )
     assert "Basic realm" in resp.headers[WWW_AUTHENTICATE]
     assert resp.status == 401
+
+
+@pytest.mark.parametrize(
+    ("headers", "data"),
+    [
+        pytest.param(
+            {"Content-Type": "application/json; charset=utf-8"},
+            '{"username": "test", "password": "pass"}',
+            id="json_charset",
+        ),
+        pytest.param(
+            {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+            "username=test&password=pass",
+            id="urlencoded_charset",
+        ),
+        pytest.param(
+            {
+                "Authorization": "Bearer sometoken123",
+                "Content-Type": "application/json",
+            },
+            '{"username": "test", "password": "pass"}',
+            id="bearer_json",
+        ),
+        pytest.param(
+            {
+                "Authorization": "Bearer sometoken123",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            "username=test&password=pass",
+            id="bearer_urlencoded",
+        ),
+    ],
+)
+@pytest.mark.parametrize("api_client", [TEST_ADDON_SLUG], indirect=True)
+async def test_auth_body_credentials(
+    api_client: TestClient,
+    mock_check_login: AsyncMock,
+    install_app_ssh: App,
+    headers: dict[str, str],
+    data: str,
+):
+    """Test credentials in the body with content type parameters or a Bearer token."""
+    mock_check_login.return_value = LoginResult(group_ids=["system-users"])
+    resp = await api_client.post("/auth", data=data, headers=headers)
+    assert resp.status == 200
+    mock_check_login.assert_awaited_once_with(install_app_ssh, "test", "pass")
+
+
+@pytest.mark.parametrize("data", ["[1]", '"test"', "1", "null"])
+@pytest.mark.parametrize("api_client", [TEST_ADDON_SLUG], indirect=True)
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_auth_json_not_an_object(
+    api_client: TestClient, mock_check_login: AsyncMock, data: str
+):
+    """Test JSON auth with a body that is not an object."""
+    resp = await api_client.post(
+        "/auth", data=data, headers={"Content-Type": "application/json"}
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["message"] == "Invalid json"
+    mock_check_login.assert_not_awaited()
 
 
 @pytest.mark.parametrize("api_client", ["local_example"], indirect=True)

@@ -10,10 +10,12 @@ from awesomeversion import AwesomeVersion
 import pytest
 
 from supervisor.backups.manager import BackupManager
+from supervisor.brand import ABEDOME_CORE_IMAGE
 from supervisor.const import DNS_SUFFIX, CoreState
 from supervisor.coresys import CoreSys
 from supervisor.docker.homeassistant import DockerHomeAssistant
 from supervisor.docker.interface import DockerInterface
+from supervisor.docker.manager import DockerAPI
 from supervisor.exceptions import DockerError, HomeAssistantError
 from supervisor.homeassistant.api import APIState, HomeAssistantAPI
 from supervisor.homeassistant.const import WSEvent
@@ -25,6 +27,17 @@ from supervisor.resolution.data import Issue
 from supervisor.updater import Updater
 
 from tests.common import AsyncIterator, load_json_fixture
+
+
+@pytest.fixture(autouse=True)
+async def running_state(coresys: CoreSys) -> None:
+    """Set the default state to a fully started system.
+
+    Starting/restarting/rebuilding Home Assistant Core via the API is only
+    allowed once Supervisor has fully started (see require_running_system).
+    Tests exercising other states set them explicitly.
+    """
+    await coresys.core.set_state(CoreState.RUNNING)
 
 
 @pytest.mark.parametrize("legacy_route", [True, False])
@@ -47,17 +60,67 @@ async def test_api_stats(
     api_client, root = core_api_client_with_root
     container.show.return_value["State"]["Status"] = "running"
     container.show.return_value["State"]["Running"] = True
-    container.stats = AsyncMock(
-        return_value=[load_json_fixture("container_stats.json")]
-    )
 
-    resp = await api_client.get(f"{root}/stats")
+    if root.startswith("/v2"):
+        # V2 always requests one-shot stats
+        stats_fixture = load_json_fixture("container_stats.json")
+        del stats_fixture["precpu_stats"]
+        with patch.object(
+            DockerAPI,
+            "_query_one_shot_stats",
+            AsyncMock(return_value=stats_fixture),
+        ):
+            resp = await api_client.get(f"{root}/stats")
+    else:
+        container.stats = AsyncMock(
+            return_value=[load_json_fixture("container_stats.json")]
+        )
+        resp = await api_client.get(f"{root}/stats")
+
     assert resp.status == 200
     result = await resp.json()
-    assert result["data"]["cpu_percent"] == 90.0
+    if root.startswith("/v2"):
+        assert "cpu_percent" not in result["data"]
+    else:
+        assert result["data"]["cpu_percent"] == 90.0
+    assert result["data"]["cpu_usage"] == 190
+    assert result["data"]["cpu_system_usage"] == 200
+    assert result["data"]["online_cpus"] == 24
     assert result["data"]["memory_usage"] == 59700000
     assert result["data"]["memory_limit"] == 4000000000
     assert result["data"]["memory_percent"] == 1.49
+
+
+async def test_api_stats_one_shot(
+    core_api_client_with_root: tuple[TestClient, str],
+    container: DockerContainer,
+):
+    """Test stats one-shot mode skips the calculated window.
+
+    V1 opts in via the ``one_shot`` query string; v2 always requests
+    one-shot stats and has no query string option (see test_api_stats).
+    """
+    api_client, root = core_api_client_with_root
+    if root.startswith("/v2"):
+        pytest.skip("v2 always uses one-shot; covered by test_api_stats")
+
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+
+    stats_fixture = load_json_fixture("container_stats.json")
+    del stats_fixture["precpu_stats"]
+    with patch.object(
+        DockerAPI, "_query_one_shot_stats", AsyncMock(return_value=stats_fixture)
+    ):
+        resp = await api_client.get(f"{root}/stats?one_shot")
+
+    assert resp.status == 200
+    result = await resp.json()
+    assert result["data"]["cpu_percent"] is None
+    assert result["data"]["cpu_usage"] == 190
+    assert result["data"]["cpu_system_usage"] == 200
+    assert result["data"]["online_cpus"] == 24
+    container.stats.assert_not_called()
 
 
 async def test_api_set_options(core_api_client_with_root: tuple[TestClient, str]):
@@ -89,9 +152,7 @@ async def test_api_set_image(
 ):
     """Test changing the image for homeassistant."""
     api_client, root = core_api_client_with_root
-    assert (
-        coresys.homeassistant.image == "ghcr.io/home-assistant/qemux86-64-homeassistant"
-    )
+    assert coresys.homeassistant.image == ABEDOME_CORE_IMAGE
     assert coresys.homeassistant.override_image is False
 
     with patch.object(HomeAssistant, "save_data"):
@@ -107,35 +168,34 @@ async def test_api_set_image(
     with patch.object(HomeAssistant, "save_data"):
         resp = await api_client.post(
             f"{root}/options",
-            json={"image": "ghcr.io/home-assistant/qemux86-64-homeassistant"},
+            json={"image": ABEDOME_CORE_IMAGE},
         )
 
     assert resp.status == 200
-    assert (
-        coresys.homeassistant.image == "ghcr.io/home-assistant/qemux86-64-homeassistant"
-    )
+    assert coresys.homeassistant.image == ABEDOME_CORE_IMAGE
     assert coresys.homeassistant.override_image is False
 
 
-async def test_api_set_managed_image(
+async def test_api_set_feed_managed_image(
     core_api_client_with_root: tuple[TestClient, str], coresys: CoreSys
-):
-    """Test setting the update feed image does not create an override."""
+) -> None:
+    """Test the ABEDOME feed image is not persisted as a custom override."""
     api_client, root = core_api_client_with_root
-    image = "ghcr.io/mauro2020/abedome-core"
 
     with (
         patch.object(
             Updater,
             "image_homeassistant",
-            new=PropertyMock(return_value=image),
+            new=PropertyMock(return_value=ABEDOME_CORE_IMAGE),
         ),
         patch.object(HomeAssistant, "save_data"),
     ):
-        resp = await api_client.post(f"{root}/options", json={"image": image})
+        resp = await api_client.post(
+            f"{root}/options", json={"image": ABEDOME_CORE_IMAGE}
+        )
 
     assert resp.status == 200
-    assert coresys.homeassistant.image == image
+    assert coresys.homeassistant.image == ABEDOME_CORE_IMAGE
     assert coresys.homeassistant.override_image is False
 
 
@@ -434,7 +494,7 @@ async def test_config_check(
 
     coresys.docker.containers.create.assert_called_once_with(
         {
-            "Image": "ghcr.io/home-assistant/qemux86-64-homeassistant:2025.1.0",
+            "Image": f"{ABEDOME_CORE_IMAGE}:2025.1.0",
             "Labels": {"supervisor_managed": ""},
             "OpenStdin": False,
             "StdinOnce": False,
@@ -463,6 +523,7 @@ async def test_config_check(
                         "Source": "/mnt/data/supervisor/share",
                         "Target": "/share",
                         "ReadOnly": False,
+                        "BindOptions": {"Propagation": "rslave"},
                     },
                 ],
                 "Dns": [str(coresys.docker.network.dns)],
@@ -582,9 +643,41 @@ async def test_update_frontend_check_fails_triggers_rollback(
     assert update_call_count == 2
     # An update_rollback issue should be created
     assert (
-        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE) in coresys.resolution.issues
+        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE, reference="2025.8.3")
+        in coresys.resolution.issues
     )
     # Old image should not be cleaned up so rollback doesn't need to re-download
+    mock_cleanup.assert_not_called()
+
+
+async def test_update_failed_without_rollback_creates_issue(
+    core_api_client_with_root: tuple[TestClient, str],
+    coresys: CoreSys,
+):
+    """Test a failed update without a rollback version raises an update_failed issue."""
+    api_client, root = core_api_client_with_root
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.homeassistant.version = AwesomeVersion("2025.8.0")
+    # Core was already in error state before the update, so there is nothing to roll back to
+    coresys.homeassistant.core._error_state = True  # pylint: disable=protected-access
+
+    with (
+        patch.object(DockerInterface, "update"),
+        patch.object(DockerInterface, "is_running", AsyncMock(return_value=True)),
+        patch.object(
+            DockerHomeAssistant,
+            "version",
+            new=PropertyMock(return_value=AwesomeVersion("2025.8.0")),
+        ),
+        patch.object(DockerInterface, "cleanup") as mock_cleanup,
+    ):
+        resp = await api_client.post(f"{root}/update", json={"version": "2025.8.3"})
+
+    assert resp.status == 400
+    assert (
+        Issue(IssueType.UPDATE_FAILED, ContextType.CORE, reference="2025.8.3")
+        in coresys.resolution.issues
+    )
     mock_cleanup.assert_not_called()
 
 
@@ -635,7 +728,8 @@ async def test_update_websocket_api_missing_triggers_rollback(
     assert update_call_count == 2
     mock_frontend_check.assert_not_called()
     assert (
-        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE) in coresys.resolution.issues
+        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE, reference="2025.8.3")
+        in coresys.resolution.issues
     )
     mock_cleanup.assert_not_called()
 
@@ -682,7 +776,8 @@ async def test_update_get_config_error_triggers_rollback(
     assert update_call_count == 2
     mock_frontend_check.assert_not_called()
     assert (
-        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE) in coresys.resolution.issues
+        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE, reference="2025.8.3")
+        in coresys.resolution.issues
     )
     mock_cleanup.assert_not_called()
 
@@ -737,7 +832,7 @@ async def test_update_image_install_failure_surfaces_error(
     # Version is unchanged and no rollback issue is created.
     assert coresys.homeassistant.version == AwesomeVersion("2025.8.0")
     assert (
-        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE)
+        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE, reference="2025.8.3")
         not in coresys.resolution.issues
     )
 
@@ -796,7 +891,7 @@ async def test_update_skips_health_check_when_core_not_running(
     # Caller (restore flow) is responsible for cleanup later.
     mock_cleanup.assert_not_called()
     assert (
-        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE)
+        Issue(IssueType.UPDATE_ROLLBACK, ContextType.CORE, reference="2026.4.4")
         not in coresys.resolution.issues
     )
     assert coresys.homeassistant.version == AwesomeVersion("2026.4.4")

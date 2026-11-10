@@ -1,13 +1,13 @@
 """Test OSAgent dbus interface."""
 
 # pylint: disable=import-error
-import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 
 from supervisor.dbus.agent import OSAgent
+from supervisor.dbus.const import DBUS_ATTR_DIAGNOSTICS
 
 from tests.common import mock_dbus_services
 from tests.dbus_service_mocks.base import DBusServiceMock
@@ -25,7 +25,7 @@ async def fixture_os_agent_service(
 async def test_dbus_osagent(
     os_agent_service: OSAgentService, dbus_session_bus: MessageBus
 ):
-    """Test OS Agent properties and the ABEDOME diagnostics guard."""
+    """Test OS Agent properties."""
     os_agent = OSAgent()
 
     assert os_agent.version is None
@@ -40,21 +40,28 @@ async def test_dbus_osagent(
     await os_agent_service.ping()
     assert os_agent.diagnostics is False
 
-    diagnostics_disabled = asyncio.Event()
-    set_diagnostics = os_agent.set_diagnostics
+    os_agent_service.emit_properties_changed({}, ["Diagnostics"])
+    await os_agent_service.ping()
+    await os_agent_service.ping()
+    assert os_agent.diagnostics is False
 
-    async def set_diagnostics_and_signal(value: bool) -> None:
-        await set_diagnostics(value)
-        diagnostics_disabled.set()
+    os_agent.properties[DBUS_ATTR_DIAGNOSTICS] = True
+    assert os_agent.diagnostics is False
 
-    with patch.object(
-        os_agent, "set_diagnostics", side_effect=set_diagnostics_and_signal
-    ) as set_diagnostics_mock:
-        os_agent_service.emit_properties_changed({}, ["Diagnostics"])
-        await os_agent_service.ping()
-        await asyncio.wait_for(diagnostics_disabled.wait(), timeout=1)
 
-    set_diagnostics_mock.assert_called_once_with(False)
+@pytest.mark.usefixtures("os_agent_service")
+async def test_dbus_osagent_forces_diagnostics_off(
+    dbus_session_bus: MessageBus,
+) -> None:
+    """Test ABEDOME actively disables diagnostics after an update."""
+    os_agent = OSAgent()
+    await os_agent.connect(dbus_session_bus)
+
+    with patch.object(os_agent, "set_diagnostics", new=AsyncMock()) as set_diagnostics:
+        await os_agent.update({DBUS_ATTR_DIAGNOSTICS: True})
+
+    set_diagnostics.assert_awaited_once_with(False)
+    assert os_agent.properties[DBUS_ATTR_DIAGNOSTICS] is False
     assert os_agent.diagnostics is False
 
 
@@ -86,6 +93,7 @@ async def test_dbus_osagent_connect_error(
         "agent_datadisk": None,
         "agent_swap": None,
         "agent_system": None,
+        "agent_timesyncd": None,
         "agent_boards": None,
         "agent_boards_yellow": None,
     }

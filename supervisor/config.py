@@ -24,6 +24,8 @@ from .const import (
     ATTR_WAIT_BOOT,
     ENV_SUPERVISOR_SHARE,
     FILE_HASSIO_CONFIG,
+    HOST_RUN_SUPERVISOR,
+    RUN_OS,
     SUPERVISOR_DATA,
     FeatureFlag,
     LogLevel,
@@ -53,10 +55,13 @@ AUDIO_DATA = PurePath("audio")
 MEDIA_DATA = PurePath("media")
 MOUNTS_FOLDER = PurePath("mounts")
 MOUNTS_CREDENTIALS = PurePath(".mounts_credentials")
-EMERGENCY_DATA = PurePath("emergency")
+MOUNTS_DEVICES = PurePath(".mounts_devices")
 APP_CONFIGS = PurePath("app_configs")
 CORE_BACKUP_DATA = PurePath("core/backup")
 CID_FILES = PurePath("cid_files")
+
+RUN_SUPERVISOR = PurePath("supervisor")
+RUN_CORE = PurePath("core")
 
 DEFAULT_BOOT_TIME = datetime.fromtimestamp(0, UTC).isoformat()
 
@@ -399,14 +404,14 @@ class CoreConfig(FileConfiguration):
         return self.path_extern_supervisor / MOUNTS_CREDENTIALS
 
     @property
-    def path_emergency(self) -> Path:
-        """Return emergency data folder."""
-        return self.path_supervisor / EMERGENCY_DATA
+    def path_mounts_devices(self) -> Path:
+        """Return mounts device links folder."""
+        return self.path_supervisor / MOUNTS_DEVICES
 
     @property
-    def path_extern_emergency(self) -> PurePath:
-        """Return emergency path external for Docker."""
-        return self.path_extern_supervisor / EMERGENCY_DATA
+    def path_extern_mounts_devices(self) -> PurePath:
+        """Return mounts device links path external for Docker."""
+        return self.path_extern_supervisor / MOUNTS_DEVICES
 
     @property
     def path_extern_media(self) -> PurePath:
@@ -422,6 +427,36 @@ class CoreConfig(FileConfiguration):
     def path_extern_cid_files(self) -> PurePath:
         """Return CID files folder."""
         return PurePath(self.path_extern_supervisor, CID_FILES)
+
+    @property
+    def path_run(self) -> Path:
+        """Return the shared run folder for sockets inside supervisor."""
+        return RUN_OS
+
+    @property
+    def path_extern_run(self) -> PurePath:
+        """Return the shared run folder for sockets external for Docker."""
+        return HOST_RUN_SUPERVISOR
+
+    @property
+    def path_run_supervisor(self) -> Path:
+        """Return folder for sockets Supervisor listens on."""
+        return self.path_run / RUN_SUPERVISOR
+
+    @property
+    def path_extern_run_supervisor(self) -> PurePath:
+        """Return folder for sockets Supervisor listens on external for Docker."""
+        return PurePath(self.path_extern_run, RUN_SUPERVISOR)
+
+    @property
+    def path_run_core(self) -> Path:
+        """Return folder for sockets Core listens on."""
+        return self.path_run / RUN_CORE
+
+    @property
+    def path_extern_run_core(self) -> PurePath:
+        """Return folder for sockets Core listens on external for Docker."""
+        return PurePath(self.path_extern_run, RUN_CORE)
 
     @property
     def apps_repositories(self) -> list[str]:

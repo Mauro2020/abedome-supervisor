@@ -21,8 +21,8 @@ async def test_sentry_disabled_by_default():
         sentry_init.assert_not_called()
 
 
-def test_sentry_initialization_disabled_by_brand_policy():
-    """Test ABEDOME policy prevents Sentry initialization even if requested."""
+def test_sentry_initialization_disabled_by_brand_policy() -> None:
+    """Test ABEDOME policy prevents Sentry even if diagnostics was requested."""
     coresys = MagicMock()
     coresys.config.diagnostics = True
 

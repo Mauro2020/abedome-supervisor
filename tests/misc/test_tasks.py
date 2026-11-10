@@ -10,7 +10,13 @@ from awesomeversion import AwesomeVersion
 import pytest
 
 from supervisor.apps.app import App
-from supervisor.const import ATTR_VERSION_TIMESTAMP, CoreState, FeatureFlag
+from supervisor.const import (
+    ATTR_VERSION_TIMESTAMP,
+    AppState,
+    CoreState,
+    FeatureFlag,
+    Folder,
+)
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import HomeAssistantError
 from supervisor.homeassistant.api import HomeAssistantAPI
@@ -175,37 +181,6 @@ async def test_watchdog_homeassistant_api_reanimation_limit(
         rebuild.assert_not_called()
 
 
-@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
-async def test_reload_updater_triggers_supervisor_update(
-    tasks: Tasks, coresys: CoreSys, mock_update_data: MockResponse
-):
-    """Test an updater reload triggers a supervisor update if there is one."""
-    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
-    await coresys.core.set_state(CoreState.RUNNING)
-
-    with (
-        patch.object(
-            Supervisor,
-            "version",
-            new=PropertyMock(return_value=AwesomeVersion("2024.10.0")),
-        ),
-        patch.object(Supervisor, "update") as update,
-    ):
-        # Set supervisor's version initially
-        await coresys.updater.reload()
-        assert coresys.supervisor.latest_version == AwesomeVersion("2024.10.0")
-
-        # No change in version means no update
-        await tasks._reload_updater()
-        update.assert_not_called()
-
-        # Version change causes an update
-        version_data = await mock_update_data.text()
-        mock_update_data.update_text(version_data.replace("2024.10.0", "2024.10.1"))
-        await tasks._reload_updater()
-        update.assert_called_once()
-
-
 @pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
 async def test_core_backup_cleanup(tasks: Tasks, coresys: CoreSys):
     """Test core backup task cleans up old backup files."""
@@ -217,7 +192,7 @@ async def test_core_backup_cleanup(tasks: Tasks, coresys: CoreSys):
     await coresys.backups.reload()
     assert (old_backup := coresys.backups.get("7fed74c8"))
     new_backup = await coresys.backups.do_backup_partial(
-        name="test", folders=["ssl"], location=".cloud_backup"
+        name="test", folders=[Folder.SSL], location=".cloud_backup"
     )
 
     old_tar = old_backup.tarfile
@@ -249,12 +224,7 @@ async def test_update_dns_skipped_when_auto_update_disabled(
 async def test_scheduled_reload_updater_triggers_one_supervisor_update(
     tasks: Tasks, coresys: CoreSys, mock_update_data: MockResponse
 ):
-    """Test scheduled reload updater triggers exactly one supervisor update.
-
-    Regression test: previously _update_supervisor ran on a separate schedule
-    in addition to being called from _reload_updater, causing duplicate updates.
-    Now only _reload_updater triggers the supervisor auto-update.
-    """
+    """Test the scheduled updater reload triggers exactly one supervisor update."""
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
     await coresys.core.set_state(CoreState.RUNNING)
 
@@ -290,6 +260,10 @@ async def test_scheduled_reload_updater_triggers_one_supervisor_update(
                 t.job for t in coresys.scheduler._tasks if t.job and not t.job.done()
             ]
             await asyncio.gather(*pending)
+
+            async with asyncio.timeout(5):
+                while not update.called:
+                    await asyncio.sleep(0)
 
             # Verify update was triggered exactly once
             update.assert_called_once()
@@ -340,3 +314,53 @@ async def test_update_apps_auto_update_success(
                 "backup": True,
             }
         )
+
+
+def _mock_watchdog_app(slug: str, responses: list[bool]) -> Mock:
+    """Return a started app with watchdog enabled and given application responses."""
+    restart_done = asyncio.get_running_loop().create_future()
+    restart_done.set_result(None)
+    return Mock(
+        spec=App,
+        slug=slug,
+        watchdog=True,
+        state=AppState.STARTED,
+        in_progress=False,
+        watchdog_application=AsyncMock(side_effect=responses),
+        restart=AsyncMock(return_value=restart_done),
+    )
+
+
+@pytest.mark.parametrize(
+    ("responses", "restarted"),
+    [
+        pytest.param([False, False], True, id="two_misses_in_a_row"),
+        pytest.param([False, True, False], False, id="miss_respond_miss"),
+    ],
+)
+async def test_watchdog_app_application_retry_counter(
+    tasks: Tasks, coresys: CoreSys, responses: list[bool], restarted: bool
+):
+    """Test app watchdog only restarts after consecutive missed responses."""
+    app = _mock_watchdog_app("local_test", responses)
+    coresys.apps.local = {app.slug: app}
+
+    for _ in responses:
+        await tasks._watchdog_app_application()
+
+    assert app.restart.called is restarted
+
+
+async def test_watchdog_app_application_first_miss_checks_other_apps(
+    tasks: Tasks, coresys: CoreSys
+):
+    """Test a first missed response does not skip checking the remaining apps."""
+    app_1 = _mock_watchdog_app("local_test_1", [False])
+    app_2 = _mock_watchdog_app("local_test_2", [False])
+    coresys.apps.local = {app_1.slug: app_1, app_2.slug: app_2}
+
+    await tasks._watchdog_app_application()
+
+    app_1.watchdog_application.assert_awaited_once()
+    app_2.watchdog_application.assert_awaited_once()
+    assert tasks._cache == {app_1.slug: 1, app_2.slug: 1}

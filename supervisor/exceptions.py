@@ -103,14 +103,18 @@ class APIInternalServerError(APIError):
     status = 500
 
 
+class APIServiceUnavailable(APIError):
+    """API service unavailable error."""
+
+    status = 503
+
+
 class APIAppNotInstalled(APIError):
     """Not installed app requested at apps API."""
 
 
-class APIDBMigrationInProgress(APIError):
+class APIDBMigrationInProgress(APIServiceUnavailable):
     """Service is unavailable due to an offline DB migration is in progress."""
-
-    status = 503
 
 
 class APIUnknownSupervisorError(APIError):
@@ -129,6 +133,65 @@ class APIUnknownSupervisorError(APIError):
             f"{self.message_template}. Check Supervisor logs for details"
         )
         super().__init__(None, logger, job_id=job_id)
+
+
+class APISocketError(HassioError):
+    """Error listening on a Unix socket for the API."""
+
+
+class APISocketAlreadyRegisteredError(APISocketError, APIConflict):
+    """Raise when the API already listens on a Unix socket path."""
+
+    error_key = "api_socket_already_registered_error"
+    message_template = "API already listens on socket {path}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, path: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"path": path}
+        super().__init__(None, logger)
+
+
+class APISocketPrepareError(APISocketError, APIUnknownSupervisorError):
+    """Raise when the path for an API socket cannot be prepared."""
+
+    error_key = "api_socket_prepare_error"
+    message_template = "Can't prepare path for API socket {path}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, path: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"path": path}
+        super().__init__(logger)
+
+
+class APISocketListenError(APISocketError, APIUnknownSupervisorError):
+    """Raise when the API cannot listen on a Unix socket."""
+
+    error_key = "api_socket_listen_error"
+    message_template = "Can't listen on API socket {path}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, path: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"path": path}
+        super().__init__(logger)
+
+
+class APISystemNotReadyError(APIServiceUnavailable):
+    """Raise when an API call is rejected because Supervisor isn't in a state that allows it.
+
+    Used by require_running_system to reject start/restart/rebuild/update
+    calls made while Supervisor's boot or backup-restore sequences are still
+    in progress (see #7189), instead of letting the internal
+    JobConditionException (meant for job/log consumers) bubble up as-is.
+    """
+
+    error_key = "system_not_ready_error"
+    message_template = (
+        "Supervisor is not ready to perform this operation, please try again later"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
 
 
 # JobManager
@@ -206,6 +269,13 @@ class HomeAssistantUpdateAlreadyInstalledError(HomeAssistantUpdateError):
         super().__init__(None, logger)
 
 
+class HomeAssistantSocketDirsError(HomeAssistantError, APIUnknownSupervisorError):
+    """Raise when the folders for Home Assistant's socket mounts cannot be created."""
+
+    error_key = "homeassistant_socket_dirs_error"
+    message_template = "Can't create the socket folders for Home Assistant"
+
+
 class HomeAssistantCrashError(HomeAssistantError):
     """Error on crash of a Home Assistant startup."""
 
@@ -218,8 +288,15 @@ class HomeAssistantAPIError(HomeAssistantError):
     """Home Assistant API exception."""
 
 
-class HomeAssistantAuthError(HomeAssistantAPIError):
-    """Home Assistant Auth API exception."""
+class HomeAssistantAuthError(HomeAssistantAPIError, APIError):
+    """Supervisor could not authenticate itself against Home Assistant."""
+
+    status = 500
+    error_key = "home_assistant_auth_error"
+    message_template = (
+        "Supervisor could not authenticate with Home Assistant. "
+        "Check Supervisor logs for details"
+    )
 
 
 class HomeAssistantWSError(HomeAssistantAPIError):
@@ -232,6 +309,35 @@ class HomeAssistantWSConnectionError(HomeAssistantWSError):
 
 class HomeAssistantJobError(HomeAssistantError, JobException):
     """Raise on Home Assistant job error."""
+
+
+class HomeAssistantNotRunningError(HomeAssistantError, APIError):
+    """Raise when Home Assistant is not running."""
+
+    error_key = "homeassistant_not_running_error"
+    message_template = "Home Assistant is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class HomeAssistantStatsTimeoutError(HomeAssistantError, APIInternalServerError):
+    """Raise when fetching stats for Home Assistant times out."""
+
+    error_key = "homeassistant_stats_timeout_error"
+    message_template = "Timed out getting stats for Home Assistant"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class HomeAssistantUnknownError(HomeAssistantError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs getting stats for Home Assistant."""
+
+    error_key = "homeassistant_unknown_error"
+    message_template = "An unknown error occurred with Home Assistant"
 
 
 # Supervisor
@@ -256,6 +362,17 @@ class SupervisorUnknownError(SupervisorError, APIUnknownSupervisorError):
     message_template = "An unknown error occurred with Supervisor"
 
 
+class SupervisorStatsTimeoutError(SupervisorError, APIInternalServerError):
+    """Raise when fetching stats for Supervisor times out."""
+
+    error_key = "supervisor_stats_timeout_error"
+    message_template = "Timed out getting stats for Supervisor"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
 class SupervisorJobError(SupervisorError, JobException):
     """Raise on job errors."""
 
@@ -269,6 +386,36 @@ class HassOSError(HassioError):
 
 class HassOSUpdateError(HassOSError):
     """Error on update of a HassOS."""
+
+
+class HassOSUpdateAlreadyInstalledError(HassOSUpdateError, APIError):
+    """Raise when the requested OS version is already installed."""
+
+    error_key = "hassos_update_already_installed_error"
+    message_template = "Version {version} is already installed"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, version: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"version": version}
+        super().__init__(None, logger)
+
+
+class HassOSUpdatePendingRebootError(HassOSUpdateError, APIError):
+    """Raise when the requested OS version is installed and awaits a reboot."""
+
+    error_key = "hassos_update_pending_reboot_error"
+    message_template = (
+        "Version {version} is already installed, reboot the system to activate it"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, version: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"version": version}
+        super().__init__(None, logger)
 
 
 class HassOSJobError(HassOSError, JobException):
@@ -298,6 +445,18 @@ class PluginJobError(PluginError, JobException):
     """Raise on job error with plugin."""
 
 
+class PluginDisabledError(PluginError, APIError):
+    """Raise when an action requires a disabled plugin."""
+
+    error_key = "plugin_disabled_error"
+    message_template = "Plugin {plugin} is disabled"
+
+    def __init__(self, plugin: str, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        self.extra_fields = {"plugin": plugin}
+        super().__init__(None, logger)
+
+
 # HaCli
 
 
@@ -311,6 +470,35 @@ class CliUpdateError(CliError):
 
 class CliJobError(CliError, PluginJobError):
     """Raise on job error with cli plugin."""
+
+
+class CliNotRunningError(CliError, APIError):
+    """Raise when the HA cli plugin is not running."""
+
+    error_key = "cli_not_running_error"
+    message_template = "HA cli is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class CliStatsTimeoutError(CliError, APIInternalServerError):
+    """Raise when fetching stats for the HA cli plugin times out."""
+
+    error_key = "cli_stats_timeout_error"
+    message_template = "Timed out getting stats for HA cli"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class CliUnknownError(CliError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs getting stats for the HA cli plugin."""
+
+    error_key = "cli_unknown_error"
+    message_template = "An unknown error occurred with HA cli"
 
 
 # Observer
@@ -340,6 +528,35 @@ class ObserverPortConflict(ObserverError, APIError):
         super().__init__(None, logger)
 
 
+class ObserverNotRunningError(ObserverError, APIError):
+    """Raise when Observer is not running."""
+
+    error_key = "observer_not_running_error"
+    message_template = "Observer is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class ObserverStatsTimeoutError(ObserverError, APIInternalServerError):
+    """Raise when fetching stats for Observer times out."""
+
+    error_key = "observer_stats_timeout_error"
+    message_template = "Timed out getting stats for Observer"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class ObserverUnknownError(ObserverError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs getting stats for Observer."""
+
+    error_key = "observer_unknown_error"
+    message_template = "An unknown error occurred with Observer"
+
+
 # Multicast
 
 
@@ -353,6 +570,46 @@ class MulticastUpdateError(MulticastError):
 
 class MulticastJobError(MulticastError, PluginJobError):
     """Raise on job error with multicast plugin."""
+
+
+class MulticastDisabledError(MulticastError, PluginDisabledError):
+    """Raise when an action requires the disabled Multicast plugin."""
+
+    error_key = "multicast_disabled_error"
+    message_template = "Multicast plugin is disabled"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__("multicast", logger)
+
+
+class MulticastNotRunningError(MulticastError, APIError):
+    """Raise when Multicast is not running."""
+
+    error_key = "multicast_not_running_error"
+    message_template = "Multicast is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class MulticastStatsTimeoutError(MulticastError, APIInternalServerError):
+    """Raise when fetching stats for Multicast times out."""
+
+    error_key = "multicast_stats_timeout_error"
+    message_template = "Timed out getting stats for Multicast"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class MulticastUnknownError(MulticastError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs getting stats for Multicast."""
+
+    error_key = "multicast_unknown_error"
+    message_template = "An unknown error occurred with Multicast"
 
 
 # DNS
@@ -370,6 +627,35 @@ class CoreDNSJobError(CoreDNSError, PluginJobError):
     """Raise on job error with dns plugin."""
 
 
+class CoreDNSNotRunningError(CoreDNSError, APIError):
+    """Raise when CoreDNS is not running."""
+
+    error_key = "coredns_not_running_error"
+    message_template = "CoreDNS is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class CoreDNSStatsTimeoutError(CoreDNSError, APIInternalServerError):
+    """Raise when fetching stats for CoreDNS times out."""
+
+    error_key = "coredns_stats_timeout_error"
+    message_template = "Timed out getting stats for CoreDNS"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class CoreDNSUnknownError(CoreDNSError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs getting stats for CoreDNS."""
+
+    error_key = "coredns_unknown_error"
+    message_template = "An unknown error occurred with CoreDNS"
+
+
 # Audio
 
 
@@ -383,6 +669,35 @@ class AudioUpdateError(AudioError):
 
 class AudioJobError(AudioError, PluginJobError):
     """Raise on job error with audio plugin."""
+
+
+class AudioNotRunningError(AudioError, APIError):
+    """Raise when Audio is not running."""
+
+    error_key = "audio_not_running_error"
+    message_template = "Audio is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class AudioStatsTimeoutError(AudioError, APIInternalServerError):
+    """Raise when fetching stats for Audio times out."""
+
+    error_key = "audio_stats_timeout_error"
+    message_template = "Timed out getting stats for Audio"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class AudioUnknownError(AudioError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs getting stats for Audio."""
+
+    error_key = "audio_unknown_error"
+    message_template = "An unknown error occurred with Audio"
 
 
 # Apps
@@ -521,6 +836,19 @@ class AppNotRunningError(AppsError, APIError):
 
     error_key = "app_not_running_error"
     message_template = "App {app} is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app}
+        super().__init__(None, logger)
+
+
+class AppStatsTimeoutError(AppsError, APIError):
+    """Raise when fetching stats for an app times out."""
+
+    status = 500
+    error_key = "app_stats_timeout_error"
+    message_template = "Timed out getting stats for app {app}"
 
     def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
         """Initialize exception."""
@@ -704,6 +1032,27 @@ class AppFileReadError(AppsError, APIError):
         super().__init__(None, logger)
 
 
+class AppRepositoryFileUnsafeError(AppsError, APIError):
+    """Raise when an app repository file is refused by repository confinement."""
+
+    error_key = "app_repository_file_unsafe_error"
+    message_template = (
+        "Refusing to read repository file of app {app} from {repository}: {error}"
+    )
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: str,
+        repository: str,
+        error: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app, "repository": repository, "error": error}
+        super().__init__(None, logger)
+
+
 class AppsJobError(AppsError, JobException):
     """Raise on job errors."""
 
@@ -803,12 +1152,201 @@ class HostAppArmorError(HostError):
     """Host apparmor functions failed."""
 
 
+class HostAppArmorLoadProfileError(HostAppArmorError, APIError):
+    """OS Agent rejected an AppArmor profile.
+
+    The profile content is user-supplied (app repository), so a parser
+    rejection is a client error. The OS Agent's D-Bus error message is
+    relayed as the reason.
+    """
+
+    error_key = "host_apparmor_load_profile_error"
+    message_template = "Can't load profile {profile_name}: {reason}"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        profile_name: str,
+        reason: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"profile_name": profile_name, "reason": reason}
+        super().__init__(None, logger)
+
+
 class HostNetworkError(HostError):
     """Error with host network."""
 
 
 class HostNetworkNotFound(HostError):
     """Return if host interface is not found."""
+
+
+class HostNetworkInterfaceUpdateError(HostNetworkError, APIUnknownSupervisorError):
+    """Raise when a requested network interface update cannot be resolved."""
+
+    error_key = "host_network_interface_update_error"
+    message_template = "Requested Network interface update is not possible"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(logger)
+
+
+class HostNetworkInterfaceUpdateNotFoundError(HostNetworkNotFound, APINotFound):
+    """Raise when an update-only request targets a missing or disabled interface."""
+
+    error_key = "host_network_interface_update_not_found_error"
+    message_template = (
+        "Requested to update interface {interface} which does not exist or is disabled"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, interface: str
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"interface": interface}
+        super().__init__(None, logger)
+
+
+class HostNetworkUpdateConfigError(HostNetworkError, APIUnknownSupervisorError):
+    """Raise when updating an existing stored connection profile fails.
+
+    The underlying error is expected to have already been logged by the
+    caller with full details, since it can't be included in a translatable
+    message.
+    """
+
+    error_key = "host_network_update_config_error"
+    message_template = "Can't update config on {interface}"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, interface: str
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"interface": interface}
+        super().__init__(logger)
+
+
+class HostNetworkCreateConfigError(HostNetworkError, APIUnknownSupervisorError):
+    """Raise when creating and activating a new connection profile fails.
+
+    The underlying error is expected to have already been logged by the
+    caller with full details, since it can't be included in a translatable
+    message.
+    """
+
+    error_key = "host_network_create_config_error"
+    message_template = "Can't create config and activate {interface}"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, interface: str
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"interface": interface}
+        super().__init__(logger)
+
+
+class HostNetworkDeleteConfigError(HostNetworkError, APIUnknownSupervisorError):
+    """Raise when deleting a stored connection profile fails.
+
+    The underlying error is expected to have already been logged by the
+    caller with full details, since it can't be included in a translatable
+    message.
+    """
+
+    error_key = "host_network_delete_config_error"
+    message_template = "Can't delete configuration for interface {interface}"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, interface: str
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"interface": interface}
+        super().__init__(logger)
+
+
+class HostNetworkDeactivateConfigError(HostNetworkError, APIUnknownSupervisorError):
+    """Raise when deactivating a connection or clearing its autoconnect flag fails.
+
+    The underlying error is expected to have already been logged by the
+    caller with full details, since it can't be included in a translatable
+    message.
+    """
+
+    error_key = "host_network_deactivate_config_error"
+    message_template = "Can't deactivate interface {interface}"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, interface: str
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"interface": interface}
+        super().__init__(logger)
+
+
+class HostNetworkActivationFailedError(HostNetworkError, APIError):
+    """Raise when a connection deactivates instead of reaching an activated state."""
+
+    error_key = "host_network_activation_failed_error"
+    message_template = "Activating connection failed, check connection settings."
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class HostNetworkActivationTimeoutError(HostNetworkError, APIError):
+    """Raise when a connection doesn't reach a terminal state before the timeout."""
+
+    error_key = "host_network_activation_timeout_error"
+    message_template = (
+        "Timed out waiting for connection to activate, check connection settings."
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class HostNetworkWifiPskRequiredError(HostNetworkError, APIError):
+    """Raise when (re)creating a wpa-psk profile without supplying a psk."""
+
+    error_key = "host_network_wifi_psk_required_error"
+    message_template = (
+        "psk is required when auth is wpa-psk, unless an existing wpa-psk "
+        "profile is being kept unchanged"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class HostNetworkWifiSsidUnresolvedError(HostNetworkError, APIError):
+    """Raise when an SSID that is not valid UTF-8 can't be matched to one network."""
+
+    error_key = "host_network_wifi_ssid_unresolved_error"
+    message_template = (
+        "SSID contains replacement characters and does not match exactly one "
+        "stored or visible network"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+class HostNetworkWifiSsidInvalidError(HostNetworkError, APIError):
+    """Raise when an SSID string cannot be encoded to bytes."""
+
+    error_key = "host_network_wifi_ssid_invalid_error"
+    message_template = "SSID is not a valid string and can't be encoded"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
 
 
 class HostLogError(HostError):
@@ -1093,6 +1631,59 @@ class DockerNotFound(DockerError):
     """Docker object don't Exists."""
 
 
+class DockerContainerNotFoundError(DockerNotFound, APINotFound):
+    """Raise when a referenced container could not be found."""
+
+    error_key = "docker_container_not_found_error"
+    message_template = "Container {name} not found"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Raise & log."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
+
+class DockerContainerNotRunningError(DockerError, APIError):
+    """Raise when an action requires a container to be running but it isn't."""
+
+    error_key = "docker_container_not_running_error"
+    message_template = "Container {name} is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Raise & log."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
+
+class DockerStatsError(DockerError):
+    """Base error interacting with container stats."""
+
+
+class DockerStatsTimeoutError(DockerStatsError, APIError):
+    """Raise when fetching stats for a container times out."""
+
+    status = 500
+    error_key = "docker_stats_timeout_error"
+    message_template = "Timed out getting stats for container {name}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Raise & log."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
+
+class DockerStatsUnknownError(DockerStatsError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs getting stats for a container."""
+
+    error_key = "docker_stats_unknown_error"
+    message_template = "An unknown error occurred getting stats for container {name}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Raise & log."""
+        self.extra_fields = {"name": name}
+        super().__init__(logger)
+
+
 class DockerNoSpaceOnDevice(DockerError):
     """Raise if a docker pull fails due to available space."""
 
@@ -1212,11 +1803,7 @@ class ResolutionNotFound(ResolutionError):
     """Raise if suggestion/issue was not found."""
 
 
-class ResolutionFixupError(HassioError):
-    """Raise if a fixup fails."""
-
-
-class ResolutionFixupJobError(ResolutionFixupError, JobException):
+class ResolutionFixupJobError(ResolutionError, JobException):
     """Raise on job error."""
 
 
@@ -1267,6 +1854,10 @@ class StoreError(HassioError):
 
 class StoreGitError(StoreError):
     """Raise if something on git is happening."""
+
+
+class StoreGitRemoteURLUpdateError(StoreGitError):
+    """Raise if updating a repository remote URL fails."""
 
 
 class StoreGitCloneError(StoreGitError):
@@ -1321,6 +1912,10 @@ class StoreInvalidAppRepo(StoreError):
     """Raise on invalid app repo."""
 
 
+class StoreRepositoryFileUnsafeError(StoreError):
+    """Raise when a store repository file resolves to a path that must not be read."""
+
+
 class StoreRepositoryUnknownError(StoreError, APIUnknownSupervisorError):
     """Raise when unknown error occurs taking an action for a store repository."""
 
@@ -1346,6 +1941,55 @@ class HomeAssistantBackupError(BackupError, HomeAssistantError):
 
 class BackupInvalidError(BackupError):
     """Raise if backup or password provided is invalid."""
+
+
+class BackupSupervisorVersionError(BackupError, APIError):
+    """Raise if backup requires a newer Supervisor version and auto update is disabled."""
+
+    error_key = "backup_supervisor_version_error"
+    message_template = (
+        "Backup was made on supervisor version {backup_version}, can't restore on "
+        "{supervisor_version}. Must update supervisor first."
+    )
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        backup_version: str,
+        supervisor_version: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {
+            "backup_version": backup_version,
+            "supervisor_version": supervisor_version,
+        }
+        super().__init__(None, logger)
+
+
+class BackupSupervisorUpdateInProgressError(BackupError, APIError):
+    """Raise if backup requires a newer Supervisor version and an auto update was just started."""
+
+    status = 503
+    error_key = "backup_supervisor_update_in_progress_error"
+    message_template = (
+        "Backup was made on supervisor version {backup_version}, can't restore on "
+        "{supervisor_version}. Update is in-progress, try again after it completes."
+    )
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        backup_version: str,
+        supervisor_version: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {
+            "backup_version": backup_version,
+            "supervisor_version": supervisor_version,
+        }
+        super().__init__(None, logger)
 
 
 class BackupMountDownError(BackupError, APIError):
@@ -1465,6 +2109,66 @@ class MountError(APIError):
 class MountActivationError(MountError):
     """Raise on mount not reaching active state after mount/reload."""
 
+    error_key = "mount_activation_error"
+    message_template = (
+        "Mount {name} is not reachable. Check the Supervisor logs for details"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
+
+class MountSetupError(MountError):
+    """Raise when the systemd units of a mount could not be set up."""
+
+    error_key = "mount_setup_error"
+    message_template = (
+        "Could not set up mount {name}. Check the Supervisor logs for details"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
+
+class MountUnmountError(MountError):
+    """Raise when a mount could not be removed from the system."""
+
+    error_key = "mount_unmount_error"
+    message_template = "Could not unmount {name}. Check the Supervisor logs for details"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
+
+class MountDiskBusyError(MountUnmountError):
+    """Raise when a disk mount could not be unmounted because it is in use."""
+
+    error_key = "mount_disk_busy_error"
+    message_template = (
+        "Could not unmount {name}, the disk is still in use. Close open files "
+        "on it or stop apps using it and try again"
+    )
+
+
+class MountReloadError(MountError):
+    """Raise when a mount could not be reloaded."""
+
+    error_key = "mount_reload_error"
+    message_template = (
+        "Could not reload mount {name}. Check the Supervisor logs for details"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
 
 class MountInvalidError(MountError):
     """Raise on invalid mount attempt."""
@@ -1501,8 +2205,209 @@ class MountTargetNotEmptyError(MountInvalidError):
         super().__init__(None, logger)
 
 
+class MountDeviceNotFoundError(MountInvalidError):
+    """Raise when no block device matches the requested device or UUID."""
+
+    error_key = "mount_device_not_found_error"
+    message_template = "No disk found matching {reference}"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, reference: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"reference": reference}
+        super().__init__(None, logger)
+
+
+class MountFilesystemNotSupportedError(MountInvalidError):
+    """Raise when a device does not hold a filesystem that can be mounted."""
+
+    error_key = "mount_filesystem_not_supported_error"
+    message_template = "{device} does not have a filesystem that can be mounted"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, device: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"device": device}
+        super().__init__(None, logger)
+
+
+class MountDeviceMismatchError(MountInvalidError):
+    """Raise when a supplied device path does not carry the supplied UUID."""
+
+    error_key = "mount_device_mismatch_error"
+    message_template = "Device {device} does not have filesystem UUID {uuid}"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        device: str,
+        uuid: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"device": device, "uuid": uuid}
+        super().__init__(None, logger)
+
+
+class MountDeviceInUseError(MountInvalidError):
+    """Raise when a device is already mounted or used by another mount."""
+
+    error_key = "mount_device_in_use_error"
+    message_template = "{device} is already in use"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, device: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"device": device}
+        super().__init__(None, logger)
+
+
+class MountDeviceProtectedError(MountInvalidError):
+    """Raise when a device belongs to the system and must not be mounted."""
+
+    error_key = "mount_device_protected_error"
+    message_template = "{device} is a system device and cannot be mounted"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, device: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"device": device}
+        super().__init__(None, logger)
+
+
+class MountDeviceReadOnlyError(MountInvalidError):
+    """Raise when a write-protected device is requested as writable."""
+
+    error_key = "mount_device_read_only_error"
+    message_template = (
+        "{device} is write-protected and can only be mounted as read-only"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, device: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"device": device}
+        super().__init__(None, logger)
+
+
+class MountDeviceMissingUUIDError(MountInvalidError):
+    """Raise when a device holds a filesystem but reports no UUID."""
+
+    error_key = "mount_device_missing_uuid_error"
+    message_template = "{device} has no filesystem UUID and cannot be mounted"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, device: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"device": device}
+        super().__init__(None, logger)
+
+
+class MountDeviceLinkError(MountError):
+    """Raise when the device link of a disk mount cannot be written."""
+
+    error_key = "mount_device_link_error"
+    message_template = "Cannot create device link {path} for mount {name}: {error}"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        name: str,
+        path: str,
+        error: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name, "path": path, "error": error}
+        super().__init__(None, logger)
+
+
+class MountDisksNotSupportedError(MountInvalidError):
+    """Raise when the host cannot mount local disks at all."""
+
+    error_key = "mount_disks_not_supported_error"
+    message_template = "Local disk mounts are not supported on this host"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Initialize exception."""
+        super().__init__(None, logger)
+
+
 class MountNotFound(MountError, APINotFound):
     """Raise on mount not found."""
+
+    error_key = "mount_not_found_error"
+    message_template = "No mount exists with name {name}"
+
+    def __init__(
+        self,
+        message: str | None = None,
+        logger: Callable[..., None] | None = None,
+        *,
+        name: str | None = None,
+    ) -> None:
+        """Initialize exception.
+
+        Callers either pass a ready-made message, as the mount manager does, or
+        just the mount name to get the template message and translation fields.
+        """
+        if name is not None:
+            self.extra_fields = {"name": name}
+        super().__init__(message, logger)
+
+
+class MountUsageNotMountedError(MountError):
+    """Raise when a mount's path is no longer a mount point.
+
+    The probe would already have activated a dormant automount, so this is a
+    plain directory. Numbers from it would be the host disk's, not the mount's.
+    """
+
+    error_key = "mount_usage_not_mounted_error"
+    message_template = (
+        "Could not read storage usage for mount {name}: no longer mounted"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
+
+
+class MountUsageReadError(MountError):
+    """Raise when reading a mount's storage usage fails."""
+
+    error_key = "mount_usage_read_error"
+    message_template = "Could not read storage usage for mount {name}: {reason}"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        name: str,
+        reason: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name, "reason": reason}
+        super().__init__(None, logger)
+
+
+class MountUsageTimeoutError(MountError):
+    """Raise when a caller gives up waiting on a mount's storage usage probe."""
+
+    error_key = "mount_usage_timeout_error"
+    message_template = "Timed out reading storage usage for mount {name}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, name: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name}
+        super().__init__(None, logger)
 
 
 class MountJobError(MountError, JobException):

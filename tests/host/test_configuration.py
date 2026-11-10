@@ -7,6 +7,7 @@ import pytest
 
 from supervisor.coresys import CoreSys
 from supervisor.dbus.const import DeviceType
+from supervisor.dbus.network.configuration import WirelessProperties
 from supervisor.host.configuration import Interface, VlanConfig, WifiConfig
 from supervisor.host.const import AuthMethod, InterfaceType, WifiMode
 
@@ -297,7 +298,7 @@ def test_map_nm_wifi_non_wireless_interface():
     mock_interface.type = DeviceType.ETHERNET
     mock_interface.settings = Mock()
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
     assert result is None
 
 
@@ -308,7 +309,7 @@ def test_map_nm_wifi_no_settings():
     mock_interface.type = DeviceType.WIRELESS
     mock_interface.settings = None
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
     assert result is None
 
 
@@ -319,18 +320,18 @@ def test_map_nm_wifi_open_authentication():
     mock_interface.type = DeviceType.WIRELESS
     mock_interface.settings = Mock()
     mock_interface.settings.wireless_security = None
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "TestSSID"
-    mock_interface.settings.wireless.mode = "infrastructure"
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"TestSSID", assigned_mac=None, mode="infrastructure", powersave=None
+    )
     mock_interface.wireless = None
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
     assert isinstance(result, WifiConfig)
     assert result.mode == WifiMode.INFRASTRUCTURE
-    assert result.ssid == "TestSSID"
+    assert result.ssid == b"TestSSID"
     assert result.auth == AuthMethod.OPEN
     assert result.psk is None
     assert result.signal is None
@@ -345,18 +346,18 @@ def test_map_nm_wifi_wep_authentication():
     mock_interface.settings.wireless_security = Mock()
     mock_interface.settings.wireless_security.key_mgmt = "none"
     mock_interface.settings.wireless_security.psk = None
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "WEPNetwork"
-    mock_interface.settings.wireless.mode = "infrastructure"
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"WEPNetwork", assigned_mac=None, mode="infrastructure", powersave=None
+    )
     mock_interface.wireless = None
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
     assert isinstance(result, WifiConfig)
     assert result.auth == AuthMethod.WEP
-    assert result.ssid == "WEPNetwork"
+    assert result.ssid == b"WEPNetwork"
     assert result.psk is None
 
 
@@ -369,36 +370,59 @@ def test_map_nm_wifi_wpa_psk_authentication():
     mock_interface.settings.wireless_security = Mock()
     mock_interface.settings.wireless_security.key_mgmt = "wpa-psk"
     mock_interface.settings.wireless_security.psk = "SecretPassword123"
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "SecureNetwork"
-    mock_interface.settings.wireless.mode = "infrastructure"
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"SecureNetwork", assigned_mac=None, mode="infrastructure", powersave=None
+    )
     mock_interface.wireless = None
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
     assert isinstance(result, WifiConfig)
     assert result.auth == AuthMethod.WPA_PSK
-    assert result.ssid == "SecureNetwork"
+    assert result.ssid == b"SecureNetwork"
     assert result.psk == "SecretPassword123"
 
 
 def test_map_nm_wifi_unsupported_authentication():
-    """Test _map_nm_wifi returns None for unsupported authentication method."""
-    # Mock wireless interface with unsupported authentication
+    """Test _map_nm_wifi reports unsupported auth instead of hiding the profile.
+
+    Regression test for a bug caught in review: an auth method Supervisor
+    doesn't understand (WPA3/sae, wpa-eap, owe, ...) used to make
+    `_map_nm_wifi` return `None` entirely, hiding both the (partially
+    understood) config *and* the independently observed signal/SSID of an
+    active connection - `state.wifi` and `config.wifi` would both go `null`
+    even while genuinely connected. It's reported as `AuthMethod.UNSUPPORTED`
+    instead, and refused only on write (see `_validate_wifi_config_v2`).
+    """
     mock_interface = Mock()
     mock_interface.type = DeviceType.WIRELESS
     mock_interface.settings = Mock()
     mock_interface.settings.wireless_security = Mock()
     mock_interface.settings.wireless_security.key_mgmt = "wpa-eap"  # Unsupported
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "EnterpriseNetwork"
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"EnterpriseNetwork",
+        assigned_mac=None,
+        mode="infrastructure",
+        powersave=None,
+    )
+    mock_interface.wireless = Mock()
+    mock_interface.wireless.active = Mock()
+    mock_interface.wireless.active.strength = 75
+    mock_interface.wireless.active.ssid = b"EnterpriseNetwork"
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
-    assert result is None
+    assert result is not None
+    assert result.auth == AuthMethod.UNSUPPORTED
+    assert result.ssid == b"EnterpriseNetwork"
+    assert result.psk is None
+    # Observed state remains visible even though the auth method (config)
+    # isn't understood.
+    assert result.signal == 75
+    assert result.active_ssid == b"EnterpriseNetwork"
 
 
 def test_map_nm_wifi_different_modes():
@@ -415,13 +439,13 @@ def test_map_nm_wifi_different_modes():
         mock_interface.type = DeviceType.WIRELESS
         mock_interface.settings = Mock()
         mock_interface.settings.wireless_security = None
-        mock_interface.settings.wireless = Mock()
-        mock_interface.settings.wireless.ssid = "TestSSID"
-        mock_interface.settings.wireless.mode = mode_value
+        mock_interface.settings.wireless = WirelessProperties(
+            ssid=b"TestSSID", assigned_mac=None, mode=mode_value, powersave=None
+        )
         mock_interface.wireless = None
         mock_interface.interface_name = "wlan0"
 
-        result = Interface._map_nm_wifi(mock_interface)
+        result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
         assert result is not None
         assert result.mode == expected_mode
@@ -434,18 +458,23 @@ def test_map_nm_wifi_with_signal():
     mock_interface.type = DeviceType.WIRELESS
     mock_interface.settings = Mock()
     mock_interface.settings.wireless_security = None
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "TestSSID"
-    mock_interface.settings.wireless.mode = "infrastructure"
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"TestSSID", assigned_mac=None, mode="infrastructure", powersave=None
+    )
     mock_interface.wireless = Mock()
     mock_interface.wireless.active = Mock()
     mock_interface.wireless.active.strength = 75
+    mock_interface.wireless.active.ssid = b"ConnectedAP"
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
     assert result.signal == 75
+    # `active_ssid` reflects the actually-connected AP, distinct from `ssid`
+    # (the stored profile's desired SSID), even when they differ.
+    assert result.active_ssid == b"ConnectedAP"
+    assert result.ssid == b"TestSSID"
 
 
 def test_map_nm_wifi_without_signal():
@@ -455,16 +484,17 @@ def test_map_nm_wifi_without_signal():
     mock_interface.type = DeviceType.WIRELESS
     mock_interface.settings = Mock()
     mock_interface.settings.wireless_security = None
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "TestSSID"
-    mock_interface.settings.wireless.mode = "infrastructure"
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"TestSSID", assigned_mac=None, mode="infrastructure", powersave=None
+    )
     mock_interface.wireless = None
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
     assert result.signal is None
+    assert result.active_ssid is None
 
 
 def test_map_nm_wifi_wireless_no_active_ap():
@@ -474,17 +504,18 @@ def test_map_nm_wifi_wireless_no_active_ap():
     mock_interface.type = DeviceType.WIRELESS
     mock_interface.settings = Mock()
     mock_interface.settings.wireless_security = None
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "TestSSID"
-    mock_interface.settings.wireless.mode = "infrastructure"
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"TestSSID", assigned_mac=None, mode="infrastructure", powersave=None
+    )
     mock_interface.wireless = Mock()
     mock_interface.wireless.active = None
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
     assert result.signal is None
+    assert result.active_ssid is None
 
 
 def test_map_nm_wifi_no_wireless_settings():
@@ -498,10 +529,10 @@ def test_map_nm_wifi_no_wireless_settings():
     mock_interface.wireless = None
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
-    assert result.ssid == ""
+    assert result.ssid == b""
     assert result.mode == WifiMode.INFRASTRUCTURE  # Default mode
 
 
@@ -512,13 +543,13 @@ def test_map_nm_wifi_no_wireless_mode():
     mock_interface.type = DeviceType.WIRELESS
     mock_interface.settings = Mock()
     mock_interface.settings.wireless_security = None
-    mock_interface.settings.wireless = Mock()
-    mock_interface.settings.wireless.ssid = "TestSSID"
-    mock_interface.settings.wireless.mode = None
+    mock_interface.settings.wireless = WirelessProperties(
+        ssid=b"TestSSID", assigned_mac=None, mode=None, powersave=None
+    )
     mock_interface.wireless = None
     mock_interface.interface_name = "wlan0"
 
-    result = Interface._map_nm_wifi(mock_interface)
+    result = Interface._map_nm_wifi(mock_interface, mock_interface.settings)
 
     assert result is not None
     assert result.mode == WifiMode.INFRASTRUCTURE  # Default mode

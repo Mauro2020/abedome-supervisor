@@ -98,6 +98,8 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
             }
         )
 
+    event.setdefault("tags", {}).update({"supervisor_state": coresys.core.state.value})
+
     # Not full startup - missing information
     if coresys.core.state in (CoreState.INITIALIZE, CoreState.SETUP):
         # During SETUP, we have basic system info available for better debugging
@@ -114,6 +116,11 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
                     "host": {
                         "machine": coresys.machine,
                     },
+                }
+            )
+            event.setdefault("tags", {}).update(
+                {
+                    "storage_driver": coresys.docker.info.storage,
                 }
             )
         return event
@@ -176,9 +183,10 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
         {plugin.slug: plugin.version for plugin in coresys.plugins.all_plugins}
     )
 
-    event["tags"].update(
+    event.setdefault("tags", {}).update(
         {
             "installation_type": "os" if coresys.os.available else "supervised",
+            "storage_driver": coresys.docker.info.storage,
         }
     )
 

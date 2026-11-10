@@ -26,13 +26,14 @@ class ConnectionProperties:
     interface_name: str | None
     mdns: int | None
     llmnr: int | None
+    autoconnect: bool | None
 
 
 @dataclass(slots=True)
 class WirelessProperties:
     """Wireless Properties object for Network Manager."""
 
-    ssid: str
+    ssid: bytes
     assigned_mac: str | None
     mode: str | None
     powersave: int | None

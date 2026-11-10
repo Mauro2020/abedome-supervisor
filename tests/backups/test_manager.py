@@ -6,6 +6,7 @@ from functools import partial
 from pathlib import Path
 from shutil import copy, rmtree
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, patch
 
 from aiodocker.containers import DockerContainer
@@ -19,7 +20,7 @@ from supervisor.apps.model import AppModel
 from supervisor.backups.backup import Backup, BackupLocation
 from supervisor.backups.const import LOCATION_TYPE, BackupJobStage, BackupType
 from supervisor.backups.manager import BackupManager
-from supervisor.const import FOLDER_HOMEASSISTANT, FOLDER_SHARE, AppState, CoreState
+from supervisor.const import AppState, CoreState, Folder
 from supervisor.coresys import CoreSys
 from supervisor.docker.app import DockerApp
 from supervisor.docker.const import ContainerState
@@ -27,11 +28,15 @@ from supervisor.docker.homeassistant import DockerHomeAssistant
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import (
     BackupError,
+    BackupFileExistError,
     BackupFileNotFoundError,
     BackupInvalidError,
     BackupJobError,
     BackupMountDownError,
+    BackupSupervisorUpdateInProgressError,
+    BackupSupervisorVersionError,
     DockerError,
+    MountError,
 )
 from supervisor.homeassistant.api import HomeAssistantAPI
 from supervisor.homeassistant.const import WSType
@@ -39,8 +44,10 @@ from supervisor.homeassistant.core import HomeAssistantCore
 from supervisor.homeassistant.module import HomeAssistant
 from supervisor.jobs import JobSchedulerOptions
 from supervisor.jobs.const import JobCondition
+from supervisor.mounts.manager import MountManager
 from supervisor.mounts.mount import Mount
 from supervisor.resolution.const import UnhealthyReason
+from supervisor.supervisor import Supervisor
 from supervisor.utils.json import read_json_file, write_json_file
 
 from tests.common import force_app_state, get_fixture_path
@@ -193,7 +200,7 @@ async def test_do_backup_partial_maximal(coresys: CoreSys, install_app_ssh: App)
     # backup_mock fixture causes Backup() to be a MagicMock
     backup_instance: MagicMock = await manager.do_backup_partial(
         apps=[TEST_ADDON_SLUG],
-        folders=[FOLDER_SHARE, FOLDER_HOMEASSISTANT],
+        folders=[Folder.SHARE],
         homeassistant=True,
     )
 
@@ -280,6 +287,36 @@ async def test_do_restore_full_different_app(
     assert coresys.core.state == CoreState.RUNNING
 
 
+@pytest.mark.usefixtures("supervisor_internet")
+async def test_do_restore_full_removes_delta_apps_after_folder_failure(
+    coresys: CoreSys, full_backup_mock: Backup, install_app_ssh: App
+):
+    """Test full restore still removes apps not in backup if folder restore fails."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.homeassistant.core.start = AsyncMock(return_value=None)
+    coresys.homeassistant.core.stop = AsyncMock(return_value=None)
+    coresys.homeassistant.core.update = AsyncMock(return_value=None)
+    install_app_ssh.uninstall = AsyncMock(return_value=None)
+
+    manager = await BackupManager(coresys).load_config()
+
+    backup_instance = full_backup_mock.return_value
+    backup_instance.app_list = ["differentslug"]
+    backup_instance.sys_apps = coresys.apps
+    backup_instance.restore_folders.return_value = False
+    backup_instance.remove_delta_apps = partial(
+        Backup.remove_delta_apps, backup_instance
+    )
+    assert not await manager.do_restore_full(backup_instance)
+
+    backup_instance.restore_folders.assert_called_once()
+    install_app_ssh.uninstall.assert_called_once()
+    backup_instance.restore_apps.assert_called_once()
+
+    assert coresys.core.state == CoreState.RUNNING
+
+
 @pytest.mark.usefixtures("supervisor_internet", "install_app_ssh")
 async def test_do_restore_partial_minimal(
     coresys: CoreSys, partial_backup_mock: Backup
@@ -306,6 +343,54 @@ async def test_do_restore_partial_minimal(
     assert coresys.core.state == CoreState.RUNNING
 
 
+@pytest.mark.usefixtures("supervisor_internet", "tmp_supervisor_data", "path_extern")
+async def test_do_restore_partial_encrypted_supervisor_config(coresys: CoreSys):
+    """Test restoring mounts and registries from a real encrypted backup.
+
+    The fixture was created by Supervisor with a password set and only contains
+    supervisor.tar.gz. Regression test for #7213.
+    """
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    copy(
+        get_fixture_path("backup_example_enc_supervisor.tar"),
+        coresys.config.path_backup,
+    )
+    await coresys.backups.reload()
+    assert (backup := coresys.backups.get("fd244f04"))
+    assert backup.protected
+
+    assert not coresys.mounts.mounts
+    assert not coresys.docker.config.registries
+
+    with (
+        patch.object(
+            Supervisor,
+            "version",
+            new=PropertyMock(return_value=AwesomeVersion("2026.09.0")),
+        ),
+        patch.object(
+            MountManager,
+            "restore_mount",
+            return_value=coresys.create_task(asyncio.sleep(0)),
+        ) as restore_mount,
+    ):
+        assert await coresys.backups.do_restore_partial(backup, password="test123")
+
+    restore_mount.assert_called_once()
+    mount = restore_mount.call_args[0][0]
+    assert mount.name == "backup_share"
+    assert mount.server == "192.168.1.10"
+    assert mount.share == "backups"
+    assert mount.username == "hass"
+    assert mount.password == "cifs_secret"
+    assert coresys.docker.config.registries["ghcr.io"] == {
+        "username": "user",
+        "password": "registry_secret",
+    }
+
+
 @pytest.mark.usefixtures("supervisor_internet")
 async def test_do_restore_partial_maximal(
     coresys: CoreSys, partial_backup_mock: Backup
@@ -323,7 +408,7 @@ async def test_do_restore_partial_maximal(
     assert await manager.do_restore_partial(
         backup_instance,
         apps=[TEST_ADDON_SLUG],
-        folders=[FOLDER_SHARE, FOLDER_HOMEASSISTANT],
+        folders=[Folder.SHARE],
         homeassistant=True,
     )
 
@@ -360,18 +445,6 @@ async def test_fail_invalid_full_backup(
     with pytest.raises(BackupInvalidError):
         await manager.do_restore_full(backup_instance)
 
-    backup_instance.all_locations[None].protected = False
-    backup_instance.supervisor_version = "2022.08.4"
-    with (
-        patch.object(
-            type(coresys.supervisor),
-            "version",
-            new=PropertyMock(return_value="2022.08.3"),
-        ),
-        pytest.raises(BackupInvalidError),
-    ):
-        await manager.do_restore_full(backup_instance)
-
 
 @pytest.mark.usefixtures("supervisor_internet")
 async def test_fail_invalid_partial_backup(
@@ -396,16 +469,196 @@ async def test_fail_invalid_partial_backup(
     with pytest.raises(BackupInvalidError):
         await manager.do_restore_partial(backup_instance, homeassistant=True)
 
+
+@pytest.mark.usefixtures("supervisor_internet")
+@pytest.mark.parametrize("restore_method", ["do_restore_full", "do_restore_partial"])
+async def test_restore_fails_supervisor_version_auto_update_disabled(
+    coresys: CoreSys,
+    full_backup_mock: MagicMock,
+    restore_method: str,
+):
+    """Test restoring a backup from a newer Supervisor raises when auto update is off."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.updater.auto_update = False
+
+    manager = await BackupManager(coresys).load_config()
+    backup_instance = full_backup_mock.return_value
     backup_instance.supervisor_version = "2022.08.4"
+
     with (
         patch.object(
             type(coresys.supervisor),
             "version",
             new=PropertyMock(return_value="2022.08.3"),
         ),
-        pytest.raises(BackupInvalidError),
+        patch.object(type(coresys.updater), "reload", new=AsyncMock()) as reload,
+        pytest.raises(BackupSupervisorVersionError) as exc_info,
     ):
-        await manager.do_restore_partial(backup_instance)
+        await getattr(manager, restore_method)(backup_instance)
+
+    assert exc_info.value.status == 400
+    assert (
+        "Backup was made on supervisor version 2022.08.4, can't restore on "
+        "2022.08.3. Must update supervisor first." in str(exc_info.value)
+    )
+    reload.assert_not_called()
+
+
+@pytest.mark.usefixtures("supervisor_internet")
+@pytest.mark.parametrize("restore_method", ["do_restore_full", "do_restore_partial"])
+async def test_restore_fails_supervisor_version_auto_update_already_in_progress(
+    coresys: CoreSys,
+    full_backup_mock: MagicMock,
+    restore_method: str,
+):
+    """Test restore raises update-in-progress without reloading if update is already known."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.updater.auto_update = True
+
+    manager = await BackupManager(coresys).load_config()
+    backup_instance = full_backup_mock.return_value
+    backup_instance.supervisor_version = "2022.08.4"
+
+    update_task = MagicMock()
+    update_task.done.return_value = False
+
+    with (
+        patch.object(
+            type(coresys.supervisor),
+            "version",
+            new=PropertyMock(return_value="2022.08.3"),
+        ),
+        patch.object(
+            type(coresys.supervisor),
+            "need_update",
+            new=PropertyMock(return_value=True),
+        ),
+        patch.object(type(coresys.updater), "reload", new=AsyncMock()) as reload,
+        patch.object(
+            type(coresys.supervisor),
+            "auto_update_supervisor",
+            new=AsyncMock(return_value=update_task),
+        ) as auto_update_supervisor,
+        pytest.raises(BackupSupervisorUpdateInProgressError) as exc_info,
+    ):
+        await getattr(manager, restore_method)(backup_instance)
+
+    assert exc_info.value.status == 503
+    assert (
+        "Backup was made on supervisor version 2022.08.4, can't restore on "
+        "2022.08.3. Update is in-progress, try again after it completes."
+        in str(exc_info.value)
+    )
+    reload.assert_not_called()
+    auto_update_supervisor.assert_called_once()
+
+
+@pytest.mark.usefixtures("supervisor_internet")
+@pytest.mark.parametrize("restore_method", ["do_restore_full", "do_restore_partial"])
+async def test_restore_fails_supervisor_version_auto_update_found_on_reload(
+    coresys: CoreSys,
+    full_backup_mock: MagicMock,
+    restore_method: str,
+):
+    """Test restore reloads updater and raises update-in-progress if an update is kicked off."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.updater.auto_update = True
+
+    manager = await BackupManager(coresys).load_config()
+    backup_instance = full_backup_mock.return_value
+    backup_instance.supervisor_version = "2022.08.4"
+
+    update_task = MagicMock()
+    update_task.done.return_value = False
+
+    fetch_task = asyncio.get_running_loop().create_future()
+    fetch_task.set_result(None)
+
+    with (
+        patch.object(
+            type(coresys.supervisor),
+            "version",
+            new=PropertyMock(return_value="2022.08.3"),
+        ),
+        patch.object(
+            type(coresys.supervisor),
+            "need_update",
+            new=PropertyMock(return_value=False),
+        ),
+        patch.object(
+            type(coresys.updater), "fetch_data", new=AsyncMock(return_value=fetch_task)
+        ) as fetch_data,
+        patch.object(
+            type(coresys.supervisor),
+            "auto_update_supervisor",
+            new=AsyncMock(return_value=update_task),
+        ) as auto_update_supervisor,
+        pytest.raises(BackupSupervisorUpdateInProgressError) as exc_info,
+    ):
+        await getattr(manager, restore_method)(backup_instance)
+
+    assert exc_info.value.status == 503
+    assert (
+        "Backup was made on supervisor version 2022.08.4, can't restore on "
+        "2022.08.3. Update is in-progress, try again after it completes."
+        in str(exc_info.value)
+    )
+    fetch_data.assert_called_once()
+    auto_update_supervisor.assert_called_once()
+
+
+@pytest.mark.usefixtures("supervisor_internet")
+@pytest.mark.parametrize("restore_method", ["do_restore_full", "do_restore_partial"])
+async def test_restore_fails_supervisor_version_no_update_available_on_reload(
+    coresys: CoreSys,
+    full_backup_mock: MagicMock,
+    restore_method: str,
+):
+    """Test restore falls back to version mismatch if reload finds no update available."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.updater.auto_update = True
+
+    manager = await BackupManager(coresys).load_config()
+    backup_instance = full_backup_mock.return_value
+    backup_instance.supervisor_version = "2022.08.4"
+
+    fetch_task = asyncio.get_running_loop().create_future()
+    fetch_task.set_result(None)
+
+    with (
+        patch.object(
+            type(coresys.supervisor),
+            "version",
+            new=PropertyMock(return_value="2022.08.3"),
+        ),
+        patch.object(
+            type(coresys.supervisor),
+            "need_update",
+            new=PropertyMock(return_value=False),
+        ),
+        patch.object(
+            type(coresys.updater), "fetch_data", new=AsyncMock(return_value=fetch_task)
+        ) as fetch_data,
+        patch.object(
+            type(coresys.supervisor),
+            "auto_update_supervisor",
+            new=AsyncMock(return_value=None),
+        ) as auto_update_supervisor,
+        pytest.raises(BackupSupervisorVersionError) as exc_info,
+    ):
+        await getattr(manager, restore_method)(backup_instance)
+
+    assert exc_info.value.status == 400
+    assert (
+        "Backup was made on supervisor version 2022.08.4, can't restore on "
+        "2022.08.3. Must update supervisor first." in str(exc_info.value)
+    )
+    fetch_data.assert_called_once()
+    auto_update_supervisor.assert_called_once()
 
 
 @pytest.mark.usefixtures("install_app_ssh", "capture_exception")
@@ -420,7 +673,7 @@ async def test_backup_error_homeassistant(coresys: CoreSys, backup_mock: MagicMo
         err := BackupError("Error while storing homeassistant")
     )
 
-    job, backup_task = coresys.jobs.schedule_job(
+    job, backup_task = await coresys.jobs.schedule_job(
         coresys.backups.do_backup_full, JobSchedulerOptions()
     )
     assert await backup_task is None
@@ -446,6 +699,26 @@ async def test_backup_error_capture(
     assert backup is None
 
     capture_exception.assert_called_once_with(err)
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_backup_existing_filename_not_deleted(coresys: CoreSys):
+    """Test a backup with an existing filename fails without deleting that file."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    existing = coresys.config.path_backup / "nightly.tar"
+    existing.write_bytes(b"existing backup")
+
+    job, backup_task = await coresys.jobs.schedule_job(
+        partial(coresys.backups.do_backup_full, filename="nightly.tar"),
+        JobSchedulerOptions(),
+    )
+    assert await backup_task is None
+
+    assert existing.read_bytes() == b"existing backup"
+    assert job.errors[0].type_ is BackupFileExistError
+    assert coresys.core.state == CoreState.RUNNING
 
 
 @pytest.mark.usefixtures("supervisor_internet")
@@ -485,7 +758,8 @@ async def test_backup_media_with_mounts(
     systemd_unit_service: SystemdUnitService = all_dbus_services["systemd_unit"]
     systemd_service.response_get_unit = [
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
-        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
@@ -516,7 +790,9 @@ async def test_backup_media_with_mounts(
     # Make a partial backup
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
-    backup: Backup = await coresys.backups.do_backup_partial("test", folders=["media"])
+    backup: Backup = await coresys.backups.do_backup_partial(
+        "test", folders=[Folder.MEDIA]
+    )
 
     # Remove the mount and wipe the media folder
     systemd_unit_service.active_state = "inactive"
@@ -526,7 +802,7 @@ async def test_backup_media_with_mounts(
 
     # Restore the backup and check that only the test files we made returned
     with patch.object(DockerHomeAssistant, "is_running", return_value=True):
-        await coresys.backups.do_restore_partial(backup, folders=["media"])
+        await coresys.backups.do_restore_partial(backup, folders=[Folder.MEDIA])
 
     assert test_file_1.exists()
     assert test_dir.is_dir()
@@ -547,13 +823,24 @@ async def test_backup_media_with_mounts_retains_files(
     """Test backing up media folder with mounts retains mount files."""
     systemd_service: SystemdService = all_dbus_services["systemd"]
     systemd_unit_service: SystemdUnitService = all_dbus_services["systemd_unit"]
-    systemd_unit_service.active_state = ["active", "active", "active", "inactive"]
+    systemd_unit_service.active_state = "active"
     systemd_service.response_get_unit = [
+        # create_mount: no .mount, no .automount
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
-        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        # create_mount: post-arm state refresh resolves the new .mount
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        # create_mount: no legacy data mount unit to clean up
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        # folder restore: unmount resolves the .mount after automount stop
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        # folder restore: repair_trigger finds no .automount after the unmount
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        # folder restore: repair's own unmount finds no .mount either
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        # folder restore: re-arm post-arm state refresh
+        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        # mount config restore: unmount of the replaced mount
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
     ]
 
@@ -575,19 +862,98 @@ async def test_backup_media_with_mounts_retains_files(
     # Make a partial backup
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
-    backup: Backup = await coresys.backups.do_backup_partial("test", folders=["media"])
+    backup: Backup = await coresys.backups.do_backup_partial(
+        "test", folders=[Folder.MEDIA]
+    )
 
     systemd_service.StopUnit.calls.clear()
     systemd_service.StartTransientUnit.calls.clear()
-    with patch.object(DockerHomeAssistant, "is_running", return_value=True):
-        await coresys.backups.do_restore_partial(backup, folders=["media"])
+    # Freeze background activation of the restored mount config — it is
+    # exercised by its own tests and would race the call assertions here
+    with (
+        patch.object(DockerHomeAssistant, "is_running", return_value=True),
+        patch.object(MountManager, "_activate_restored_mount"),
+    ):
+        await coresys.backups.do_restore_partial(backup, folders=[Folder.MEDIA])
 
+    # Restore unmounts the network mount nested inside `media` (stops
+    # both the .automount and .mount), then repairs the trigger after
+    # writes: repair_trigger sees the .automount is gone, tears down once
+    # more (only the .automount stop is dispatched — the .mount is gone
+    # too) and arms a fresh transient .automount + aux .mount pair.
+    # The backup also carries the mount configuration, so the mount is
+    # replaced afterwards: another unmount plus the activation mount.
     assert systemd_service.StopUnit.calls == [
-        ("mnt-data-supervisor-media-media_test.mount", "fail")
+        ("mnt-data-supervisor-media-media_test.automount", "fail"),
+        ("mnt-data-supervisor-media-media_test.mount", "fail"),
+        ("mnt-data-supervisor-media-media_test.automount", "fail"),
+        ("mnt-data-supervisor-media-media_test.automount", "fail"),
+        ("mnt-data-supervisor-media-media_test.mount", "fail"),
     ]
     assert systemd_service.StartTransientUnit.calls == [
-        ("mnt-data-supervisor-media-media_test.mount", "fail", ANY, [])
+        ("mnt-data-supervisor-media-media_test.automount", "fail", ANY, ANY)
     ]
+
+
+@pytest.mark.usefixtures(
+    "supervisor_internet",
+    "tmp_supervisor_data",
+    "path_extern",
+    "mount_propagation",
+    "mock_is_mount",
+)
+async def test_folder_restore_repairs_trigger_on_unmount_failure(
+    coresys: CoreSys, all_dbus_services: dict[str, DBusServiceMock]
+):
+    """Test folder restore repairs the automount trigger if unmount fails."""
+    systemd_service: SystemdService = all_dbus_services["systemd"]
+    systemd_unit_service: SystemdUnitService = all_dbus_services["systemd_unit"]
+    systemd_unit_service.active_state = "active"
+    systemd_service.response_get_unit = [
+        # create_mount: no .mount, no .automount
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        # create_mount: post-arm state refresh resolves the new .mount
+        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        # create_mount: no legacy data mount unit to clean up
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+    ]
+
+    # Add a media mount nested inside the folder to be restored
+    await coresys.mounts.load()
+    await coresys.mounts.create_mount(
+        Mount.from_dict(
+            coresys,
+            {
+                "name": "media_test",
+                "usage": "media",
+                "type": "cifs",
+                "server": "test.local",
+                "share": "test",
+            },
+        )
+    )
+
+    # Make a partial backup
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    backup: Backup = await coresys.backups.do_backup_partial(
+        "test", folders=[Folder.MEDIA]
+    )
+
+    # A failed unmount aborts the restore before any file is written, but
+    # the finally must still repair the automount trigger so the path does
+    # not stay a plain writable directory — and the error must surface
+    with (
+        patch.object(Mount, "unmount", side_effect=MountError("boom")),
+        patch.object(Mount, "repair_trigger") as repair_trigger,
+        pytest.raises(MountError),
+    ):
+        async with backup.open(None):
+            # pylint: disable-next=protected-access
+            await backup._folder_restore(Folder.MEDIA)
+
+    repair_trigger.assert_awaited_once()
 
 
 @pytest.mark.usefixtures(
@@ -613,7 +979,8 @@ async def test_backup_share_with_mounts(
     ]
     systemd_service.response_get_unit = [
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
-        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
@@ -644,7 +1011,9 @@ async def test_backup_share_with_mounts(
     # Make a partial backup
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
-    backup: Backup = await coresys.backups.do_backup_partial("test", folders=["share"])
+    backup: Backup = await coresys.backups.do_backup_partial(
+        "test", folders=[Folder.SHARE]
+    )
 
     # Remove the mount and wipe the media folder
     await coresys.mounts.remove_mount("share_test")
@@ -653,7 +1022,7 @@ async def test_backup_share_with_mounts(
 
     # Restore the backup and check that only the test files we made returned
     with patch.object(DockerHomeAssistant, "is_running", return_value=True):
-        await coresys.backups.do_restore_partial(backup, folders=["share"])
+        await coresys.backups.do_restore_partial(backup, folders=[Folder.SHARE])
 
     assert test_file_1.exists()
     assert test_dir.is_dir()
@@ -805,7 +1174,7 @@ async def test_backup_to_down_mount_error(coresys: CoreSys, mock_is_mount: Magic
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
     with patch(
-        "supervisor.mounts.mount._probe_network_mount",
+        "supervisor.mounts.mount._probe_mount",
         side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
     ):
         with pytest.raises(BackupMountDownError):
@@ -814,6 +1183,62 @@ async def test_backup_to_down_mount_error(coresys: CoreSys, mock_is_mount: Magic
             await coresys.backups.do_backup_partial(
                 "test", location=mount, homeassistant=True
             )
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern", "mount_propagation")
+@pytest.mark.parametrize(
+    ("probe", "copied", "error_types"),
+    [
+        pytest.param({"return_value": True}, True, [], id="mount_up"),
+        pytest.param(
+            {"side_effect": OSError(errno.EHOSTDOWN, "Host is down")},
+            False,
+            [BackupMountDownError],
+            id="mount_unreachable",
+        ),
+        pytest.param(
+            {"return_value": False}, False, [BackupMountDownError], id="not_mounted"
+        ),
+    ],
+)
+async def test_backup_copy_to_additional_mount(
+    coresys: CoreSys,
+    mock_is_mount: MagicMock,
+    probe: dict[str, Any],
+    copied: bool,
+    error_types: list[type[Exception]],
+):
+    """Test copying a backup to an additional mount location checks the mount."""
+    (mount_dir := coresys.config.path_mounts / "backup_test").mkdir()
+    await coresys.mounts.load()
+    mount = Mount.from_dict(
+        coresys,
+        {
+            "name": "backup_test",
+            "usage": "backup",
+            "type": "cifs",
+            "server": "test.local",
+            "share": "test",
+        },
+    )
+    await coresys.mounts.create_mount(mount)
+
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    mock_is_mount.configure_mock(**probe)
+
+    backup = await coresys.backups.do_backup_partial(
+        "test", folders=[Folder.SHARE], additional_locations=[mount]
+    )
+
+    assert backup
+    assert backup.location is None
+    assert ("backup_test" in backup.all_locations) is copied
+    assert (mount_dir / f"{backup.slug}.tar").exists() is copied
+    job = next(
+        job for job in coresys.jobs.jobs if job.name == "backup_copy_to_location"
+    )
+    assert [error.type_ for error in job.errors] == error_types
 
 
 @pytest.mark.usefixtures(
@@ -917,7 +1342,7 @@ async def test_backup_to_default_mount_down_error(
 
     with (
         patch(
-            "supervisor.mounts.mount._probe_network_mount",
+            "supervisor.mounts.mount._probe_mount",
             side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
         ),
         pytest.raises(BackupMountDownError),
@@ -1195,7 +1620,7 @@ async def test_backup_progress(
 
     ha_ws_client.async_send_command.reset_mock()
     partial_backup: Backup = await coresys.backups.do_backup_partial(
-        apps=["local_ssh"], folders=["media", "share", "ssl"]
+        apps=["local_ssh"], folders=[Folder.MEDIA, Folder.SHARE, Folder.SSL]
     )
     await asyncio.sleep(0)
 
@@ -1342,11 +1767,11 @@ async def test_restore_progress(
     ]
 
     folders_backup: Backup = await coresys.backups.do_backup_partial(
-        folders=["media", "share", "ssl"]
+        folders=[Folder.MEDIA, Folder.SHARE, Folder.SSL]
     )
     ha_ws_client.async_send_command.reset_mock()
     await coresys.backups.do_restore_partial(
-        folders_backup, folders=["media", "share", "ssl"]
+        folders_backup, folders=[Folder.MEDIA, Folder.SHARE, Folder.SSL]
     )
     await asyncio.sleep(0)
 
@@ -1719,12 +2144,13 @@ async def test_backup_to_mount_bypasses_free_space_condition(
     with pytest.raises(BackupJobError):
         await coresys.backups.do_backup_full()
     with pytest.raises(BackupJobError):
-        await coresys.backups.do_backup_partial(folders=["media"])
+        await coresys.backups.do_backup_partial(folders=[Folder.MEDIA])
 
     systemd_service: SystemdService = all_dbus_services["systemd"]
     systemd_service.response_get_unit = [
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
-        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
+        DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
         DBusError("org.freedesktop.systemd1.NoSuchUnit", "error"),
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
         "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
@@ -1749,7 +2175,7 @@ async def test_backup_to_mount_bypasses_free_space_condition(
 
     # These succeed because local free space does not matter when using a mount
     await coresys.backups.do_backup_full(location=mount)
-    await coresys.backups.do_backup_partial(folders=["media"], location=mount)
+    await coresys.backups.do_backup_partial(folders=[Folder.MEDIA], location=mount)
 
 
 @pytest.mark.parametrize(
@@ -2307,7 +2733,7 @@ async def test_backup_app_skips_uninstalled(
 
     with patch.object(Backup, "store_apps", new=mock_store_apps):
         backup: Backup = await coresys.backups.do_backup_partial(
-            apps=["local_example"], folders=["ssl"]
+            apps=["local_example"], folders=[Folder.SSL]
         )
 
     assert "local_example" not in coresys.apps.local

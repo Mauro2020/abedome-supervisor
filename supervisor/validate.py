@@ -25,6 +25,7 @@ from .const import (
     ATTR_ENABLE_IPV6,
     ATTR_FEATURE_FLAGS,
     ATTR_FORCE_SECURITY,
+    ATTR_GROUP_IDS,
     ATTR_HASSOS,
     ATTR_HASSOS_UNRESTRICTED,
     ATTR_HASSOS_UPGRADE,
@@ -55,11 +56,11 @@ from .const import (
     LogLevel,
     UpdateChannel,
 )
-from .docker.utils import get_registry_from_image
+from .docker.utils import is_registry_domain, split_docker_domain
 from .utils.validate import validate_timezone
 
 # Move to store.validate when addons_repository config removed
-RE_REPOSITORY = re.compile(r"^(?P<url>[^#]+)(?:#(?P<branch>[\w\-./]+))?$")
+RE_REPOSITORY = re.compile(r"^(?P<url>[^#\s]+)(?:#(?P<branch>[\w\-./]+))?$")
 RE_REGISTRY = re.compile(r"^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$")
 
 # pylint: disable=no-value-for-parameter
@@ -74,20 +75,19 @@ def docker_image(image: str) -> str:
     """Validate a Docker image name without tag.
 
     Tags are not allowed as the version/tag is managed separately.
-    Uses IMAGE_REGISTRY_REGEX from docker.utils for robust registry detection.
     """
     if not image or not isinstance(image, str):
         raise vol.Invalid(f"Expected a non-empty string for docker image, got: {image}")
 
-    # Extract registry if present (handles domains, IPv4/IPv6, ports, localhost)
-    registry = get_registry_from_image(image)
+    # Split off the registry if present (handles domains, IPv4/IPv6, ports,
+    # localhost) to validate the remaining image path components
+    registry, path = split_docker_domain(image)
     if registry:
         # Registry must be lowercase
         if registry != registry.lower():
             raise vol.Invalid(f"Docker image registry must be lowercase: {image}")
-        path = image[len(registry) + 1 :]  # Remove "registry/" prefix
-    else:
-        path = image
+        if not is_registry_domain(registry):
+            raise vol.Invalid(f"Invalid Docker image registry '{registry}' in: {image}")
 
     if not path:
         raise vol.Invalid(f"Docker image has no name: {image}")
@@ -237,16 +237,18 @@ SCHEMA_SUPERVISOR_CONFIG = vol.All(
 )
 
 
+SCHEMA_DOCKER_REGISTRY = vol.Schema(
+    {
+        vol.All(str, vol.Match(RE_REGISTRY)): {
+            vol.Required(ATTR_USERNAME): str,
+            vol.Required(ATTR_PASSWORD): str,
+        }
+    }
+)
+
 SCHEMA_DOCKER_CONFIG = vol.Schema(
     {
-        vol.Optional(ATTR_REGISTRIES, default=dict): vol.Schema(
-            {
-                vol.All(str, vol.Match(RE_REGISTRY)): {
-                    vol.Required(ATTR_USERNAME): str,
-                    vol.Required(ATTR_PASSWORD): str,
-                }
-            }
-        ),
+        vol.Optional(ATTR_REGISTRIES, default=dict): SCHEMA_DOCKER_REGISTRY,
         vol.Optional(ATTR_ENABLE_IPV6, default=None): vol.Maybe(vol.Boolean()),
         vol.Optional(ATTR_MTU, default=None): vol.Maybe(
             vol.All(int, vol.Range(min=68, max=65535))
@@ -255,7 +257,20 @@ SCHEMA_DOCKER_CONFIG = vol.Schema(
 )
 
 
-SCHEMA_AUTH_CONFIG = vol.Schema({sha256: sha256})
+# Entries written before group IDs were cached are a bare password hash
+SCHEMA_AUTH_CONFIG = vol.Schema(
+    {
+        sha256: vol.Any(
+            sha256,
+            vol.Schema(
+                {
+                    vol.Required(ATTR_PASSWORD): sha256,
+                    vol.Required(ATTR_GROUP_IDS): [str],
+                }
+            ),
+        )
+    }
+)
 
 SCHEMA_SESSION_DATA = vol.Schema(
     {
@@ -289,7 +304,7 @@ SCHEMA_INGRESS_CONFIG = vol.Schema(
 # pylint: disable=no-value-for-parameter
 SCHEMA_SECURITY_CONFIG = vol.Schema(
     {
-        vol.Optional(ATTR_PWNED, default=True): vol.Boolean(),
+        vol.Optional(ATTR_PWNED, default=False): vol.Boolean(),
         vol.Optional(ATTR_FORCE_SECURITY, default=False): vol.Boolean(),
     },
     extra=vol.REMOVE_EXTRA,

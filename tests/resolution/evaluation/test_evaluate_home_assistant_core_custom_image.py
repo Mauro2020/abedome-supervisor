@@ -1,9 +1,10 @@
 """Test Core image evaluation."""
 
-from unittest.mock import PropertyMock, patch
+from unittest.mock import patch
 
 import pytest
 
+from supervisor.brand import ABEDOME_CORE_IMAGE
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
 from supervisor.resolution.evaluations.home_assistant_core_custom_image import (
@@ -15,7 +16,7 @@ from supervisor.resolution.evaluations.home_assistant_core_custom_image import (
     ("image", "expected"),
     [
         (None, False),  # Unset, default image is used
-        ("ghcr.io/home-assistant/qemux86-64-homeassistant", False),  # Default image
+        (ABEDOME_CORE_IMAGE, False),  # ABEDOME-managed image
         ("myorg/qemux86-64-homeassistant", True),  # Fork on another registry
         ("ghcr.io/myorg/qemux86-64-homeassistant", True),  # Fork on same registry
     ],
@@ -32,23 +33,6 @@ async def test_core_image_evaluation(
     assert evaluation.reason not in coresys.resolution.unsupported
     await evaluation()
     assert (evaluation.reason in coresys.resolution.unsupported) is expected
-
-
-async def test_managed_abedome_core_image_is_supported(coresys: CoreSys):
-    """Test the Core image managed by the ABEDOME feed is supported."""
-    evaluation = EvaluateHomeAssistantCoreCustomImage(coresys)
-    await coresys.core.set_state(CoreState.RUNNING)
-    image = "ghcr.io/mauro2020/abedome-core"
-
-    with patch(
-        "supervisor.updater.Updater.image_homeassistant",
-        new_callable=PropertyMock,
-        return_value=image,
-    ):
-        coresys.homeassistant.set_image(image)
-        await evaluation()
-
-    assert evaluation.reason not in coresys.resolution.unsupported
 
 
 async def test_core_image_evaluation_resolves(coresys: CoreSys):

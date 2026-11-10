@@ -4,10 +4,12 @@ from contextlib import suppress
 from datetime import timedelta
 import json
 import logging
+from typing import Any
 
 import aiohttp
 from awesomeversion import AwesomeVersion
 
+from .brand import ABEDOME_CORE_IMAGE, ABEDOME_SUPERVISOR_IMAGE
 from .bus import EventListener
 from .const import (
     ATTR_AUDIO,
@@ -26,6 +28,7 @@ from .const import (
     FILE_HASSIO_UPDATER,
     URL_HASSIO_VERSION,
     BusEvent,
+    CoreState,
     UpdateChannel,
 )
 from .coresys import CoreSys, CoreSysAttributes
@@ -60,18 +63,24 @@ class Updater(FileConfiguration, CoreSysAttributes):
 
     async def reload(self) -> None:
         """Update internal data."""
-        # If there's no connectivity, delay initial version fetch
         if not self.sys_supervisor.connectivity:
-            _LOGGER.debug("No Supervisor connectivity, delaying version fetch")
+            # If there's no connectivity, delay version fetch until it's back
             if not self._connectivity_listener:
+                _LOGGER.debug("No Supervisor connectivity, delaying version fetch")
                 self._connectivity_listener = self.sys_bus.register_event(
                     BusEvent.SUPERVISOR_CONNECTIVITY_CHANGE, self._check_connectivity
                 )
-            _LOGGER.info("No Supervisor connectivity, delaying version fetch")
-            return
+        else:
+            # fetch_data is a detached, REJECT-concurrency job. A call while
+            # one is already in-flight gets back that same task instead of
+            # starting a redundant fetch, and awaiting it here surfaces the
+            # real outcome instead of relying on the throttle window.
+            with suppress(UpdaterError):
+                if task := await self.fetch_data():
+                    await task
 
-        with suppress(UpdaterError):
-            await self.fetch_data()
+        if self.sys_core.state == CoreState.RUNNING and self.sys_supervisor.need_update:
+            await self.sys_supervisor.auto_update_supervisor()
 
     @property
     def version_homeassistant(self) -> AwesomeVersion | None:
@@ -156,18 +165,20 @@ class Updater(FileConfiguration, CoreSysAttributes):
         """Return image of Home Assistant docker."""
         if ATTR_HOMEASSISTANT not in self._data[ATTR_IMAGE]:
             return None
-        return self._data[ATTR_IMAGE][ATTR_HOMEASSISTANT].format(
+        image = self._data[ATTR_IMAGE][ATTR_HOMEASSISTANT].format(
             machine=self.sys_machine
         )
+        return image if image == ABEDOME_CORE_IMAGE else None
 
     @property
     def image_supervisor(self) -> str | None:
         """Return image of Supervisor docker."""
         if ATTR_SUPERVISOR not in self._data[ATTR_IMAGE]:
             return None
-        return self._data[ATTR_IMAGE][ATTR_SUPERVISOR].format(
+        image = self._data[ATTR_IMAGE][ATTR_SUPERVISOR].format(
             arch=self.sys_arch.supervisor
         )
+        return image if image == ABEDOME_SUPERVISOR_IMAGE else None
 
     @property
     def image_cli(self) -> str | None:
@@ -248,8 +259,9 @@ class Updater(FileConfiguration, CoreSysAttributes):
         ],
         on_condition=UpdaterJobError,
         throttle_period=timedelta(seconds=30),
-        concurrency=JobConcurrency.QUEUE,
+        concurrency=JobConcurrency.REJECT,
         throttle=JobThrottle.THROTTLE,
+        detach=True,
     )
     async def fetch_data(self):
         """Fetch current versions from Github.
@@ -298,22 +310,25 @@ class Updater(FileConfiguration, CoreSysAttributes):
             raise UpdaterError(f"Invalid data from {url}", _LOGGER.warning)
 
         events = ["supervisor", "core"]
+        # Collect into local dicts so a missing key leaves _data untouched
+        versions: dict[str, Any] = {}
+        images: dict[str, Any] = {}
         try:
             # Update supervisor version
-            self._data[ATTR_SUPERVISOR] = AwesomeVersion(data["supervisor"])
+            versions[ATTR_SUPERVISOR] = AwesomeVersion(data["supervisor"])
 
             # Update Home Assistant core version
-            self._data[ATTR_HOMEASSISTANT] = AwesomeVersion(
+            versions[ATTR_HOMEASSISTANT] = AwesomeVersion(
                 data["homeassistant"][machine]
             )
 
             # Update HassOS version
             if self.sys_os.board:
-                self._data[ATTR_OTA] = data["ota"]
+                versions[ATTR_OTA] = data["ota"]
                 if version := data["hassos"].get(self.sys_os.board):
-                    self._data[ATTR_HASSOS_UNRESTRICTED] = AwesomeVersion(version)
+                    versions[ATTR_HASSOS_UNRESTRICTED] = AwesomeVersion(version)
                     # Store the upgrade map for persistent access
-                    self._data[ATTR_HASSOS_UPGRADE] = data.get("hassos-upgrade", {})
+                    versions[ATTR_HASSOS_UPGRADE] = data.get("hassos-upgrade", {})
                     events.append("os")
                 else:
                     _LOGGER.warning(
@@ -322,25 +337,38 @@ class Updater(FileConfiguration, CoreSysAttributes):
                     )
 
             # Update Home Assistant plugins
-            self._data[ATTR_CLI] = AwesomeVersion(data["cli"])
-            self._data[ATTR_DNS] = AwesomeVersion(data["dns"])
-            self._data[ATTR_AUDIO] = AwesomeVersion(data["audio"])
-            self._data[ATTR_OBSERVER] = AwesomeVersion(data["observer"])
-            self._data[ATTR_MULTICAST] = AwesomeVersion(data["multicast"])
+            versions[ATTR_CLI] = AwesomeVersion(data["cli"])
+            versions[ATTR_DNS] = AwesomeVersion(data["dns"])
+            versions[ATTR_AUDIO] = AwesomeVersion(data["audio"])
+            versions[ATTR_OBSERVER] = AwesomeVersion(data["observer"])
+            versions[ATTR_MULTICAST] = AwesomeVersion(data["multicast"])
 
             # Update images for that versions
-            self._data[ATTR_IMAGE][ATTR_HOMEASSISTANT] = data["images"]["core"]
-            self._data[ATTR_IMAGE][ATTR_SUPERVISOR] = data["images"]["supervisor"]
-            self._data[ATTR_IMAGE][ATTR_AUDIO] = data["images"]["audio"]
-            self._data[ATTR_IMAGE][ATTR_CLI] = data["images"]["cli"]
-            self._data[ATTR_IMAGE][ATTR_DNS] = data["images"]["dns"]
-            self._data[ATTR_IMAGE][ATTR_OBSERVER] = data["images"]["observer"]
-            self._data[ATTR_IMAGE][ATTR_MULTICAST] = data["images"]["multicast"]
+            images[ATTR_HOMEASSISTANT] = data["images"]["core"]
+            images[ATTR_SUPERVISOR] = data["images"]["supervisor"]
+            images[ATTR_AUDIO] = data["images"]["audio"]
+            images[ATTR_CLI] = data["images"]["cli"]
+            images[ATTR_DNS] = data["images"]["dns"]
+            images[ATTR_OBSERVER] = data["images"]["observer"]
+            images[ATTR_MULTICAST] = data["images"]["multicast"]
 
         except KeyError as err:
             raise UpdaterError(
                 f"Can't process version data: {err}", _LOGGER.warning
             ) from err
+
+        if (
+            images[ATTR_HOMEASSISTANT] != ABEDOME_CORE_IMAGE
+            or images[ATTR_SUPERVISOR] != ABEDOME_SUPERVISOR_IMAGE
+        ):
+            raise UpdaterError(
+                "Update manifest does not reference the ABEDOME Core and "
+                "Supervisor images",
+                _LOGGER.warning,
+            )
+
+        self._data.update(versions)
+        self._data[ATTR_IMAGE].update(images)
 
         await self.save_data()
 

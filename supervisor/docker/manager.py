@@ -38,11 +38,15 @@ from ..const import (
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
     DockerAPIError,
+    DockerContainerNotFoundError,
+    DockerContainerNotRunningError,
     DockerContainerPortConflict,
     DockerError,
     DockerNoSpaceOnDevice,
     DockerNotFound,
     DockerRegistryRateLimitExceeded,
+    DockerStatsTimeoutError,
+    DockerStatsUnknownError,
     DockerTimeoutError,
 )
 from ..utils.common import FileConfiguration
@@ -60,7 +64,7 @@ from .const import (
 from .manifest import RegistryManifestFetcher
 from .monitor import DockerMonitor
 from .network import DockerNetwork
-from .utils import get_registry_from_image
+from .utils import get_registry_from_image, is_corrupt_container_error
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -249,16 +253,14 @@ class DockerConfig(FileConfiguration):
 
         # Check if image uses a custom registry (e.g., ghcr.io/org/image)
         registry = get_registry_from_image(image)
-        if registry:
-            if registry in self.registries:
-                return registry
-        else:
-            # No registry prefix means Docker Hub
-            # Support both docker.io (official) and hub.docker.com (legacy)
-            if DOCKER_HUB in self.registries:
-                return DOCKER_HUB
-            if DOCKER_HUB_LEGACY in self.registries:
-                return DOCKER_HUB_LEGACY
+        if registry and registry != DOCKER_HUB:
+            return registry if registry in self.registries else None
+
+        # No registry prefix or an explicit Docker Hub domain
+        # Support both docker.io (official) and hub.docker.com (legacy)
+        for hub_registry in (DOCKER_HUB, DOCKER_HUB_LEGACY):
+            if hub_registry in self.registries:
+                return hub_registry
 
         return None
 
@@ -365,6 +367,7 @@ class DockerAPI(CoreSysAttributes):
         tmpfs: dict[str, str] | None = None,
         entrypoint: list[str] | None = None,
         cap_add: list[Capabilities] | None = None,
+        cap_drop: list[Capabilities] | None = None,
         ulimits: list[Ulimit] | None = None,
         cpu_rt_runtime: int | None = None,
         stdin_open: bool = False,
@@ -402,6 +405,8 @@ class DockerAPI(CoreSysAttributes):
             host_config["Tmpfs"] = tmpfs
         if cap_add:
             host_config["CapAdd"] = cap_add
+        if cap_drop:
+            host_config["CapDrop"] = cap_drop
         if cpu_rt_runtime is not None:
             host_config["CPURealtimeRuntime"] = cpu_rt_runtime
         if pid_mode:
@@ -745,21 +750,23 @@ class DockerAPI(CoreSysAttributes):
     ) -> dict[str, Any]:
         """Pull the specified image and return it.
 
-        This mimics the high level API of images.pull but provides better error handling by raising
-        based on a docker error on pull. Whereas the high level API ignores all errors on pull and
-        raises only if the get fails afterwards. Additionally it fires progress reports for the pull
-        on the bus so listeners can use that to update status for users.
+        Streams the pull to fire progress reports on the bus so listeners can
+        update status for users. aiodocker raises DockerStreamError on error
+        entries in the stream, which is mapped to the matching Supervisor
+        exception (e.g. registry rate limit or no space left on device).
         """
         # Timeout is disabled for pull operations by default, matching docker-py behavior.
-        async for e in self.images.pull(
-            repository, tag=tag, platform=platform, auth=auth, stream=True
-        ):
-            entry = PullLogEntry.from_pull_log_dict(job_id, e)
-            if entry.error:
-                raise entry.exception
-            await asyncio.gather(
-                *self.sys_bus.fire_event(BusEvent.DOCKER_IMAGE_PULL_UPDATE, entry)
-            )
+        try:
+            async for e in self.images.pull(
+                repository, tag=tag, platform=platform, auth=auth, stream=True
+            ):
+                entry = PullLogEntry.from_pull_log_dict(job_id, e)
+                await asyncio.gather(
+                    *self.sys_bus.fire_event(BusEvent.DOCKER_IMAGE_PULL_UPDATE, entry)
+                )
+        except aiodocker.DockerStreamError as err:
+            # aiodocker raises on error chunks in the stream instead of yielding them
+            raise PullLogEntry(job_id=job_id, error=err.message).exception from err
 
         sep = "@" if tag.startswith("sha256:") else ":"
         return await self.images.inspect(f"{repository}{sep}{tag}")
@@ -870,8 +877,9 @@ class DockerAPI(CoreSysAttributes):
     ) -> bool:
         """Return True if docker container exists in good state and is built from expected image."""
         try:
-            docker_container = await self.containers.get(name)
-            container_metadata = await docker_container.show()
+            # container() builds the handle from the name with no I/O;
+            # show() below performs the actual inspect call.
+            container_metadata = await self.containers.container(name).show()
             docker_image = await self.images.inspect(f"{image}:{version}")
         except TimeoutError as err:
             raise DockerTimeoutError(
@@ -880,6 +888,14 @@ class DockerAPI(CoreSysAttributes):
             ) from err
         except aiodocker.DockerError as err:
             if err.status == HTTPStatus.NOT_FOUND:
+                return False
+            if is_corrupt_container_error(err):
+                _LOGGER.warning(
+                    "Container %s storage metadata is corrupt, "
+                    "treating the container as missing: %s",
+                    name,
+                    err,
+                )
                 return False
             raise DockerError(
                 f"Could not get container {name} or image {image}:{version} to check state: {err!s}",
@@ -899,12 +915,17 @@ class DockerAPI(CoreSysAttributes):
         self, name: str, timeout: int, remove_container: bool = True
     ) -> None:
         """Stop/remove Docker container."""
+        # container() builds the handle from the name with no I/O; stop()
+        # below addresses it by name/id directly. Docker returns 304 (not
+        # an error) if the container was already stopped, so there's no
+        # need to inspect it first just to check its state.
+        docker_container = self.containers.container(name)
         try:
-            docker_container = await self.containers.get(name)
-            container_metadata = await docker_container.show()
+            _LOGGER.info("Stopping %s application", name)
+            await docker_container.stop(t=timeout)
         except TimeoutError as err:
             raise DockerTimeoutError(
-                f"Timeout getting container {name} for stopping",
+                f"Timeout stopping container {name}",
                 _LOGGER.error,
             ) from err
         except aiodocker.DockerError as err:
@@ -912,23 +933,26 @@ class DockerAPI(CoreSysAttributes):
                 # Generally suppressed so we don't log this
                 raise DockerNotFound from None
             raise DockerError(
-                f"Could not get container {name} for stopping: {err!s}",
+                f"Could not stop container {name}: {err!s}",
                 _LOGGER.error,
             ) from err
 
-        if container_metadata["State"]["Status"] == "running":
-            _LOGGER.info("Stopping %s application", name)
-            with suppress(aiodocker.DockerError):
-                await docker_container.stop(t=timeout)
-
         if remove_container:
-            with suppress(aiodocker.DockerError):
-                _LOGGER.info("Cleaning %s application", name)
-                await docker_container.delete(force=True, v=True)
+            _LOGGER.info("Cleaning %s application", name)
+            await self._remove_container_record(name)
 
-            cidfile_path = self.coresys.config.path_cid_files / f"{name}.cid"
-            with suppress(OSError):
-                await self.sys_run_in_executor(cidfile_path.unlink, missing_ok=True)
+    async def _remove_container_record(self, name: str) -> None:
+        """Force remove a container and its cid file without inspecting it.
+
+        Only safe under the container's job lock (stop/start/restart), where
+        no concurrent lifecycle operation can have recreated the name.
+        """
+        with suppress(aiodocker.DockerError):
+            await self.containers.container(name).delete(force=True, v=True)
+
+        cidfile_path = self.coresys.config.path_cid_files / f"{name}.cid"
+        with suppress(OSError):
+            await self.sys_run_in_executor(cidfile_path.unlink, missing_ok=True)
 
     async def start_container(self, name: str) -> None:
         """Start Docker container."""
@@ -943,6 +967,12 @@ class DockerAPI(CoreSysAttributes):
                 raise DockerNotFound(
                     f"{name} not found for starting up", _LOGGER.error
                 ) from None
+            if is_corrupt_container_error(err):
+                raise DockerNotFound(
+                    f"Container {name} storage metadata is corrupt, "
+                    "treating the container as missing",
+                    _LOGGER.warning,
+                ) from err
             raise DockerError(
                 f"Could not get {name} for starting up", _LOGGER.error
             ) from err
@@ -953,6 +983,16 @@ class DockerAPI(CoreSysAttributes):
         except TimeoutError as err:
             raise DockerTimeoutError(f"Timeout starting {name}", _LOGGER.error) from err
         except aiodocker.DockerError as err:
+            if is_corrupt_container_error(err):
+                # With the containerd image store a corrupt container inspects
+                # fine and only fails here; remove the broken record so the
+                # next start recreates the container.
+                await self._remove_container_record(name)
+                raise DockerNotFound(
+                    f"Container {name} storage metadata is corrupt, removed the "
+                    "container so the next start recreates it",
+                    _LOGGER.warning,
+                ) from err
             raise DockerError(f"Can't start {name}: {err}", _LOGGER.error) from err
 
     async def restart_container(self, name: str, timeout: int) -> None:
@@ -969,6 +1009,12 @@ class DockerAPI(CoreSysAttributes):
                 raise DockerNotFound(
                     f"Container {name} not found for restarting", _LOGGER.warning
                 ) from None
+            if is_corrupt_container_error(err):
+                raise DockerNotFound(
+                    f"Container {name} storage metadata is corrupt, "
+                    "treating the container as missing",
+                    _LOGGER.warning,
+                ) from err
             raise DockerError(
                 f"Could not get container {name} for restarting: {err!s}", _LOGGER.error
             ) from err
@@ -977,6 +1023,16 @@ class DockerAPI(CoreSysAttributes):
         try:
             await container.restart(t=timeout)
         except aiodocker.DockerError as err:
+            if is_corrupt_container_error(err):
+                # With the containerd image store a corrupt container inspects
+                # fine and only fails here; remove the broken record so the
+                # next start recreates the container.
+                await self._remove_container_record(name)
+                raise DockerNotFound(
+                    f"Container {name} storage metadata is corrupt, removed the "
+                    "container so the next start recreates it",
+                    _LOGGER.warning,
+                ) from err
             raise DockerError(f"Can't restart {name}: {err}", _LOGGER.warning) from err
 
     async def container_logs(self, name: str, tail: int = 100) -> list[str]:
@@ -992,6 +1048,12 @@ class DockerAPI(CoreSysAttributes):
                 raise DockerNotFound(
                     f"Container {name} not found for logs", _LOGGER.warning
                 ) from None
+            if is_corrupt_container_error(err):
+                raise DockerNotFound(
+                    f"Container {name} storage metadata is corrupt, "
+                    "treating the container as missing",
+                    _LOGGER.warning,
+                ) from err
             raise DockerError(
                 f"Could not get container {name} for logs: {err!s}", _LOGGER.error
             ) from err
@@ -1005,55 +1067,73 @@ class DockerAPI(CoreSysAttributes):
                 f"Can't grep logs from {name}: {err}", _LOGGER.warning
             ) from err
 
-    async def container_stats(self, name: str) -> dict[str, Any]:
-        """Read and return stats from container."""
+    async def _query_one_shot_stats(self, name: str) -> dict[str, Any]:
+        """Query Docker directly for a one-shot container stats sample.
+
+        aiodocker has no native support for the "one-shot" query parameter
+        added in Docker API 1.41, so the request is made directly against the
+        same endpoint it uses internally. There's an open PR to add proper
+        support upstream: https://github.com/aio-libs/aiodocker/pull/1054.
+        Kept as a small, standalone wrapper so this reach into aiodocker's
+        protected internals is contained to a single spot, making it easy to
+        remove once that's available.
+        """
+        async with self.docker._query(  # pylint: disable=protected-access
+            f"containers/{name}/stats",
+            params={"stream": "0", "one-shot": "1"},
+        ) as response:
+            return await response.json(content_type=None)
+
+    async def container_stats(
+        self, name: str, *, one_shot: bool = False
+    ) -> dict[str, Any]:
+        """Read and return stats from container.
+
+        By default this waits ~1s for Docker to gather two samples so it can
+        return a windowed CPU percentage, which requires the container to be
+        running. When ``one_shot`` is True, Docker is asked directly for a
+        single, immediate sample of the container's lifetime totals instead
+        (no wait, no comparison window, and it doesn't matter whether the
+        container is currently running).
+        """
+        stats: dict[str, Any] | None
         try:
-            docker_container = await self.containers.get(name)
-            container_metadata = await docker_container.show()
+            if one_shot:
+                stats = await self._query_one_shot_stats(name)
+            else:
+                # containers.container() builds a container handle from the
+                # name alone with no I/O, unlike containers.get(), which
+                # would inspect the container just to look up its id.
+                stats_list = await self.containers.container(name).stats(stream=False)
+                stats = stats_list[-1] if stats_list else None
         except TimeoutError as err:
-            raise DockerTimeoutError(
-                f"Timeout inspecting container '{name}'", _LOGGER.error
-            ) from err
+            raise DockerStatsTimeoutError(_LOGGER.error, name=name) from err
         except aiodocker.DockerError as err:
             if err.status == HTTPStatus.NOT_FOUND:
-                raise DockerNotFound(
-                    f"Container {name} not found for stats", _LOGGER.warning
-                ) from None
-            raise DockerError(
-                f"Could not inspect container '{name}': {err!s}", _LOGGER.error
-            ) from err
-
-        # container is not running
-        if container_metadata["State"]["Status"] != "running":
-            raise DockerError(f"Container {name} is not running", _LOGGER.error)
-
-        try:
-            stats = await docker_container.stats(stream=False)
-        except aiodocker.DockerError as err:
-            raise DockerError(
-                f"Can't read stats from {name}: {err}", _LOGGER.error
-            ) from err
+                raise DockerContainerNotFoundError(_LOGGER.warning, name=name) from None
+            _LOGGER.error("Can't read stats from %s: %s", name, err)
+            raise DockerStatsUnknownError(name=name) from err
 
         if not stats:
-            raise DockerError(f"Could not get stats for {name}", _LOGGER.error)
-        return stats[-1]
+            _LOGGER.error("Docker returned no stats for %s", name)
+            raise DockerStatsUnknownError(name=name)
+
+        # Docker returns a stub response containing only the container's
+        # id/name (no cpu_stats/memory_stats/networks data) for a
+        # container that is stopped or restarting, instead of an error.
+        # online_cpus is only ever present while the container is
+        # running, making it a reliable way to detect that stub.
+        if "online_cpus" not in stats.get("cpu_stats", {}):
+            raise DockerContainerNotRunningError(_LOGGER.error, name=name)
+
+        return stats
 
     async def container_run_inside(self, name: str, command: str) -> ExecReturn:
         """Execute a command inside Docker container."""
-        try:
-            docker_container = await self.containers.get(name)
-        except TimeoutError as err:
-            raise DockerTimeoutError(
-                f"Timeout getting container {name} to run command"
-            ) from err
-        except aiodocker.DockerError as err:
-            if err.status == HTTPStatus.NOT_FOUND:
-                raise DockerNotFound(
-                    f"Container {name} not found for running command", _LOGGER.warning
-                ) from None
-            raise DockerError(
-                f"Can't get container {name} to run command: {err!s}"
-            ) from err
+        # container() builds the handle from the name with no I/O; exec()
+        # below addresses it by name/id directly and will surface a
+        # not-found error itself.
+        docker_container = self.containers.container(name)
 
         # Execute - use detach=False to wait for completion and capture output
         try:
@@ -1082,6 +1162,10 @@ class DockerAPI(CoreSysAttributes):
                     _LOGGER.error,
                 )
         except aiodocker.DockerError as err:
+            if err.status == HTTPStatus.NOT_FOUND:
+                raise DockerNotFound(
+                    f"Container {name} not found for running command", _LOGGER.warning
+                ) from None
             raise DockerError(
                 f"Can't run command in container {name}: {err!s}"
             ) from err
@@ -1140,6 +1224,10 @@ class DockerAPI(CoreSysAttributes):
             resp: list[dict[str, Any]] = await self.images.import_image(
                 image_tar_stream
             )
+        except aiodocker.DockerStreamError as err:
+            raise DockerError(
+                f"Can't import image from tar: {err.message}", _LOGGER.error
+            ) from err
         except aiodocker.DockerError as err:
             raise DockerError(
                 f"Can't import image from tar: {err}", _LOGGER.error
@@ -1155,11 +1243,6 @@ class DockerAPI(CoreSysAttributes):
 
         docker_image_list: list[str] = []
         for chunk in resp:
-            if "errorDetail" in chunk:
-                raise DockerError(
-                    f"Can't import image from tar: {chunk['errorDetail']['message']}",
-                    _LOGGER.error,
-                )
             if "stream" in chunk:
                 if match := RE_IMPORT_IMAGE_STREAM.search(chunk["stream"]):
                     docker_image_list.append(match.group(2))

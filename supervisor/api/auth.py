@@ -6,18 +6,24 @@ import logging
 from typing import Any, cast
 
 from aiohttp import BasicAuth, web
-from aiohttp.hdrs import AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE
+from aiohttp.hdrs import AUTHORIZATION, WWW_AUTHENTICATE
 from aiohttp.web import FileField
 from aiohttp.web_exceptions import HTTPUnauthorized
 from multidict import MultiDictProxy
 import voluptuous as vol
 
 from ..apps.app import App
-from ..const import ATTR_NAME, ATTR_PASSWORD, ATTR_USERNAME, REQUEST_FROM
-from ..coresys import CoreSysAttributes
-from ..exceptions import APIForbidden, AuthInvalidNonStringValueError
-from .const import (
+from ..auth import LoginResult
+from ..const import (
     ATTR_GROUP_IDS,
+    ATTR_NAME,
+    ATTR_PASSWORD,
+    ATTR_USERNAME,
+    REQUEST_FROM,
+)
+from ..coresys import CoreSysAttributes
+from ..exceptions import APIError, APIForbidden, AuthInvalidNonStringValueError
+from .const import (
     ATTR_IS_ACTIVE,
     ATTR_IS_OWNER,
     ATTR_LOCAL_ONLY,
@@ -44,7 +50,9 @@ REALM_HEADER: dict[str, str] = {
 class APIAuth(CoreSysAttributes):
     """Handle RESTful API for auth functions."""
 
-    def _process_basic(self, request: web.Request, app: App) -> Awaitable[bool]:
+    def _process_basic(
+        self, request: web.Request, app: App
+    ) -> Awaitable[LoginResult | None]:
         """Process login request with basic auth.
 
         Return a coroutine.
@@ -60,7 +68,7 @@ class APIAuth(CoreSysAttributes):
         request: web.Request,
         app: App,
         data: dict[str, Any] | MultiDictProxy[str | bytes | bytearray | FileField],
-    ) -> Awaitable[bool]:
+    ) -> Awaitable[LoginResult | None]:
         """Process login with dict data.
 
         Return a coroutine.
@@ -79,32 +87,35 @@ class APIAuth(CoreSysAttributes):
         return self.sys_auth.check_login(app, cast(str, username), cast(str, password))
 
     @api_process
-    async def auth(self, request: web.Request) -> bool:
-        """Process login request."""
+    async def auth(self, request: web.Request) -> dict[str, Any]:
+        """Process login request, returning the group IDs of the user."""
         app = request[REQUEST_FROM]
 
         if not isinstance(app, App) or not app.access_auth_api:
             raise APIForbidden("Can't use Home Assistant auth!")
 
-        # BasicAuth
-        if AUTHORIZATION in request.headers:
-            if not await self._process_basic(request, app):
+        # BasicAuth, other schemes may carry the app's own Supervisor token
+        auth_scheme = request.headers.get(AUTHORIZATION, "").partition(" ")[0]
+        if auth_scheme.lower() == "basic":
+            if (login := await self._process_basic(request, app)) is None:
                 raise HTTPUnauthorized(headers=REALM_HEADER)
-            return True
+            return {ATTR_GROUP_IDS: login.group_ids}
 
         # Json
-        if request.headers.get(CONTENT_TYPE) == CONTENT_TYPE_JSON:
+        if request.content_type == CONTENT_TYPE_JSON:
             data = await request.json(loads=json_loads)
-            if not await self._process_dict(request, app, data):
+            if not isinstance(data, dict):
+                raise APIError("Invalid json")
+            if (login := await self._process_dict(request, app, data)) is None:
                 raise HTTPUnauthorized
-            return True
+            return {ATTR_GROUP_IDS: login.group_ids}
 
         # URL encoded
-        if request.headers.get(CONTENT_TYPE) == CONTENT_TYPE_URL:
+        if request.content_type == CONTENT_TYPE_URL:
             data = await request.post()
-            if not await self._process_dict(request, app, data):
+            if (login := await self._process_dict(request, app, data)) is None:
                 raise HTTPUnauthorized
-            return True
+            return {ATTR_GROUP_IDS: login.group_ids}
 
         # Advertise Basic authentication by default
         raise HTTPUnauthorized(headers=REALM_HEADER)

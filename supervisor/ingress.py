@@ -13,6 +13,7 @@ from .const import (
     FILE_HASSIO_INGRESS,
     INGRESS_DYNAMIC_PORT_MAX,
     INGRESS_DYNAMIC_PORT_MIN,
+    HomeAssistantUser,
     IngressSessionData,
     IngressSessionDataDict,
 )
@@ -34,6 +35,9 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         super().__init__(FILE_HASSIO_INGRESS, SCHEMA_INGRESS_CONFIG)
         self.coresys: CoreSys = coresys
         self.tokens: dict[str, str] = {}
+        # User records by ID, resolved from Core and not persisted so a
+        # restart picks up user changes. Only known users are ever added.
+        self.users: dict[str, HomeAssistantUser] = {}
 
     def get(self, token: str) -> App | None:
         """Return app they have this ingress token."""
@@ -105,10 +109,12 @@ class Ingress(FileConfiguration, CoreSysAttributes):
             if valid_dt < now:
                 continue
 
-            # Is valid
+            # Sessions without user data predate Core 2023.9 and cannot be authorized
+            if not (session_data := self.sessions_data.get(session)):
+                continue
+
             sessions[session] = valid
-            if session_data := self.sessions_data.get(session):
-                sessions_data[session] = session_data
+            sessions_data[session] = session_data
 
         # Write back
         self.sessions.clear()
@@ -136,6 +142,11 @@ class Ingress(FileConfiguration, CoreSysAttributes):
 
         return session
 
+    def remove_session(self, session: str) -> None:
+        """Invalidate a session."""
+        self.sessions.pop(session, None)
+        self.sessions_data.pop(session, None)
+
     def validate_session(self, session: str) -> bool:
         """Return True if session valid and make it longer valid."""
         if session not in self.sessions:
@@ -149,14 +160,13 @@ class Ingress(FileConfiguration, CoreSysAttributes):
             self.sessions[session] = (utcnow() + timedelta(minutes=15)).timestamp()
             return True
 
-        # Is still valid?
-        if valid_until < utcnow():
-            _LOGGER.debug("Session is no longer valid (%f/%f)", valid_until, utcnow())
+        now = utcnow()
+        if valid_until < now:
+            _LOGGER.debug("Session is no longer valid (%s/%s)", valid_until, now)
             return False
 
-        # Update time
-        valid_until = valid_until + timedelta(minutes=15)
-        self.sessions[session] = valid_until.timestamp()
+        # Sliding window, renewed from now on every request
+        self.sessions[session] = (now + timedelta(minutes=15)).timestamp()
 
         return True
 

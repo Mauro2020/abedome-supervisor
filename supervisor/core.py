@@ -5,7 +5,7 @@ from collections.abc import Awaitable
 from contextlib import suppress
 from datetime import timedelta
 import logging
-from typing import Self
+from typing import Final, Self
 
 from .brand import apply_upstream_diagnostics_policy
 from .const import (
@@ -23,7 +23,6 @@ from .exceptions import (
     HassioError,
     HomeAssistantCrashError,
     HomeAssistantError,
-    SupervisorUpdateError,
     WhoamiError,
     WhoamiSSLError,
 )
@@ -34,6 +33,9 @@ from .utils.sentry import async_capture_exception
 from .utils.whoami import retrieve_whoami
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+_STARTUP_HEALTHCHECK_TIMEOUT: Final = 30
 
 
 class Core(CoreSysAttributes):
@@ -116,7 +118,9 @@ class Core(CoreSysAttributes):
 
         if self.sys_supervisor.need_update:
             self.sys_resolution.create_issue(
-                IssueType.UPDATE_ROLLBACK, ContextType.SUPERVISOR
+                IssueType.UPDATE_ROLLBACK,
+                ContextType.SUPERVISOR,
+                reference=str(self.sys_config.version),
             )
             self.sys_resolution.add_unhealthy_reason(UnhealthyReason.SUPERVISOR)
 
@@ -235,17 +239,40 @@ class Core(CoreSysAttributes):
             if not self.healthy:
                 _LOGGER.warning("Ignoring Supervisor updates!")
             else:
-                with suppress(SupervisorUpdateError):
-                    await self.sys_supervisor.update()
-                    return
+                with suppress(HassioError):
+                    # Detached job: errors are raised on the returned task
+                    if task := await self.sys_supervisor.update():
+                        await task
+                        return
 
+        # Reserve Core's TCP port before booting other apps, since Core runs
+        # with --network=host and competes with them for it. Released again
+        # just before Core starts so it can claim the port itself. Any other
+        # path that starts Core in the meantime (API, watchdog, restore)
+        # releases it too: HomeAssistantCore.start()/restart() own that.
         try:
+            await self.sys_homeassistant.core.reserve_port()
+
             # Start app mark as initialize
             await self.sys_apps.boot(AppStartup.INITIALIZE)
 
             # HomeAssistant is already running, only Supervisor restarted
             if await self.sys_hardware.helper.last_boot() == self.sys_config.last_boot:
                 _LOGGER.info("Detected Supervisor restart")
+                # Only update, rebuild and restore remove the Core container, so
+                # a missing one means the Supervisor restart interrupted one of
+                # them. An update of a deliberately stopped Core also leaves no
+                # container; starting Core in that case is accepted, since boot
+                # can be disabled to opt out.
+                if (
+                    self.sys_homeassistant.boot
+                    and not await self.sys_homeassistant.core.instance.is_initialize()
+                ):
+                    _LOGGER.warning(
+                        "Home Assistant Core container is missing, starting Core"
+                    )
+                    await self.sys_homeassistant.core.release_port()
+                    await self._start_core()
                 return
 
             # reset register services / discovery
@@ -257,22 +284,18 @@ class Core(CoreSysAttributes):
             # start app mark as services
             await self.sys_apps.boot(AppStartup.SERVICES)
 
+            # Release the reservation so Core can bind its own port. This is
+            # best-effort only: Core's port is just its API/frontend bind, so
+            # Core must be started regardless -- if it can't bind yet it just
+            # logs and keeps retrying, which beats not starting Core at all.
+            await self.sys_homeassistant.core.release_port()
+
             # run HomeAssistant
             if (
                 self.sys_homeassistant.boot
                 and not await self.sys_homeassistant.core.is_running()
             ):
-                _LOGGER.info("Start Home Assistant Core")
-                try:
-                    await self.sys_homeassistant.core.start()
-                except HomeAssistantCrashError as err:
-                    _LOGGER.error("Can't start Home Assistant Core - rebuilding")
-                    await async_capture_exception(err)
-
-                    with suppress(HomeAssistantError):
-                        await self.sys_homeassistant.core.rebuild()
-                except HomeAssistantError as err:
-                    await async_capture_exception(err)
+                await self._start_core()
             else:
                 _LOGGER.info("Skipping start of Home Assistant")
 
@@ -291,18 +314,33 @@ class Core(CoreSysAttributes):
             await self._update_last_boot()
 
         finally:
+            # Ensure the port reservation is always released
+            await self.sys_homeassistant.core.release_port()
+
             # Add core tasks into scheduler
             await self.sys_tasks.load()
 
             # If landingpage / run upgrade in background
             if self.sys_homeassistant.version == LANDINGPAGE:
-                self.sys_create_task(self.sys_homeassistant.core.install())
+                self.sys_create_background_task(self.sys_homeassistant.core.install())
 
             # Update Host/Device information
             self.sys_create_task(self.sys_host.reload())
-            self.sys_create_task(self.sys_resolution.healthcheck())
 
             await self.set_state(CoreState.RUNNING)
+
+            # Home Assistant refreshes issues on startup complete and removes
+            # repairs (and their ignored state) of issues not raised yet
+            healthcheck = self.sys_create_task(self.sys_resolution.healthcheck())
+            _, pending = await asyncio.wait(
+                {healthcheck}, timeout=_STARTUP_HEALTHCHECK_TIMEOUT
+            )
+            if pending:
+                _LOGGER.warning(
+                    "Healthcheck did not finish within %ds, completing startup",
+                    _STARTUP_HEALTHCHECK_TIMEOUT,
+                )
+
             self.sys_homeassistant.websocket.supervisor_update_event(
                 "supervisor", {ATTR_STARTUP: "complete"}
             )
@@ -446,6 +484,20 @@ class Core(CoreSysAttributes):
             await self.sys_plugins.shutdown()
         finally:
             self._shutdown_event.set()
+
+    async def _start_core(self) -> None:
+        """Start Home Assistant Core, rebuilding it if it crashes."""
+        _LOGGER.info("Start Home Assistant Core")
+        try:
+            await self.sys_homeassistant.core.start()
+        except HomeAssistantCrashError as err:
+            _LOGGER.error("Can't start Home Assistant Core - rebuilding")
+            await async_capture_exception(err)
+
+            with suppress(HomeAssistantError):
+                await self.sys_homeassistant.core.rebuild()
+        except HomeAssistantError as err:
+            await async_capture_exception(err)
 
     async def _update_last_boot(self) -> None:
         """Update last boot time."""

@@ -26,8 +26,14 @@ from ..exceptions import (
     ConfigurationFileError,
     CoreDNSError,
     CoreDNSJobError,
+    CoreDNSNotRunningError,
+    CoreDNSStatsTimeoutError,
+    CoreDNSUnknownError,
     CoreDNSUpdateError,
+    DockerContainerNotFoundError,
+    DockerContainerNotRunningError,
     DockerError,
+    DockerStatsTimeoutError,
     PluginError,
 )
 from ..jobs.const import JobThrottle
@@ -76,6 +82,7 @@ class PluginDns(PluginBase):
         self._hosts_template: jinja2.Template | None = None
 
         self._hosts: list[HostEntry] = []
+        self._hosts_lock: asyncio.Lock = asyncio.Lock()
         self._loop: bool = False
         self._cached_locals: list[str] | None = None
 
@@ -441,16 +448,19 @@ class PluginDns(PluginBase):
 
     async def write_hosts(self) -> None:
         """Write hosts from memory to file."""
-        # Generate config file
-        data = self.hosts_template.render(entries=self._hosts)
+        # Apps start and stop in parallel and each update rewrites this file,
+        # serialize the writes so an older snapshot can't overwrite a newer one
+        async with self._hosts_lock:
+            # Generate config file
+            data = self.hosts_template.render(entries=self._hosts)
 
-        try:
-            await self.sys_run_in_executor(
-                self.hosts.write_text, data, encoding="utf-8"
-            )
-        except OSError as err:
-            self.sys_resolution.check_oserror(err)
-            raise CoreDNSError(f"Can't update hosts: {err}", _LOGGER.error) from err
+            try:
+                await self.sys_run_in_executor(
+                    self.hosts.write_text, data, encoding="utf-8"
+                )
+            except OSError as err:
+                self.sys_resolution.check_oserror(err)
+                raise CoreDNSError(f"Can't update hosts: {err}", _LOGGER.error) from err
 
     async def add_host(
         self, ipv4: IPv4Address, names: list[str], write: bool = True
@@ -501,12 +511,17 @@ class PluginDns(PluginBase):
                 return entry
         return None
 
-    async def stats(self) -> DockerStats:
+    async def stats(self, *, one_shot: bool = False) -> DockerStats:
         """Return stats of CoreDNS."""
         try:
-            return await self.instance.stats()
+            return await self.instance.stats(one_shot=one_shot)
+        except (DockerContainerNotFoundError, DockerContainerNotRunningError) as err:
+            raise CoreDNSNotRunningError(_LOGGER.warning) from err
+        except DockerStatsTimeoutError as err:
+            raise CoreDNSStatsTimeoutError(_LOGGER.error) from err
         except DockerError as err:
-            raise CoreDNSError from err
+            _LOGGER.error("Could not get stats of container for CoreDNS: %s", err)
+            raise CoreDNSUnknownError from err
 
     async def repair(self) -> None:
         """Repair CoreDNS plugin."""

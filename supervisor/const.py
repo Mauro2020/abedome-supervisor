@@ -4,16 +4,25 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
-from os import environ
-from pathlib import Path
+import os
+from pathlib import Path, PurePath
 from sys import version_info as systemversion
-from typing import Any, NotRequired, Self, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict
 
 from aiohttp import __version__ as aiohttpversion
 from aiohttp.web import RequestKey
 
+from .brand import validate_update_feed_template
+
+if TYPE_CHECKING:
+    from .config import CoreConfig
+
 SUPERVISOR_VERSION = "9999.09.9.dev9999"
 SERVER_SOFTWARE = f"HomeAssistantSupervisor/{SUPERVISOR_VERSION} aiohttp/{aiohttpversion} Python/{systemversion[0]}.{systemversion[1]}"
+
+# aiohttp's 8190 byte default is too small for some servers, e.g. GitHub's
+# release download redirects carry a ~9 KiB Content-Security-Policy header.
+WEBSESSION_MAX_HEADER_SIZE: int = 65536
 
 DOCKER_PREFIX: str = "hassio"
 AUDIO_DOCKER_NAME: str = f"{DOCKER_PREFIX}_audio"
@@ -22,11 +31,11 @@ DNS_DOCKER_NAME: str = f"{DOCKER_PREFIX}_dns"
 OBSERVER_DOCKER_NAME: str = f"{DOCKER_PREFIX}_observer"
 SUPERVISOR_DOCKER_NAME: str = f"{DOCKER_PREFIX}_supervisor"
 
-URL_HASSIO_APPS = "https://github.com/home-assistant/addons"
+URL_HASSIO_APPS = "https://github.com/home-assistant/apps"
+URL_HASSIO_APPS_LEGACY = "https://github.com/home-assistant/addons"
 URL_HASSIO_APPARMOR = "https://version.home-assistant.io/apparmor_{channel}.txt"
-URL_HASSIO_VERSION = environ.get(
-    "SUPERVISOR_VERSION_URL",
-    "https://version.home-assistant.io/{channel}.json",
+URL_HASSIO_VERSION = validate_update_feed_template(
+    os.environ.get("SUPERVISOR_VERSION_URL")
 )
 
 SUPERVISOR_DATA = Path("/data")
@@ -49,7 +58,11 @@ FILE_SUFFIX_CONFIGURATION = [".yaml", ".yml", ".json"]
 
 MACHINE_ID = Path("/etc/machine-id")
 RUN_SUPERVISOR_STATE = Path("/run/supervisor")
-SOCKET_CORE = Path("/run/os/core.sock")
+# Host /run/supervisor as seen from inside the Supervisor container
+RUN_OS = Path("/run/os")
+HOST_RUN_SUPERVISOR = PurePath("/run/supervisor")
+SOCKET_NAME_CORE = "core.sock"
+SOCKET_NAME_SUPERVISOR = "supervisor.sock"
 SOCKET_DBUS = Path("/run/dbus/system_bus_socket")
 SOCKET_DOCKER = Path("/run/docker.sock")
 SYSTEMD_JOURNAL_PERSISTENT = Path("/var/log/journal")
@@ -104,6 +117,7 @@ RESULT_OK = "ok"
 HEADER_REMOTE_USER_ID = "X-Remote-User-Id"
 HEADER_REMOTE_USER_NAME = "X-Remote-User-Name"
 HEADER_REMOTE_USER_DISPLAY_NAME = "X-Remote-User-Display-Name"
+HEADER_REMOTE_USER_GROUPS = "X-Remote-User-Groups"
 HEADER_TOKEN_OLD = "X-Hassio-Key"
 HEADER_TOKEN = "X-Supervisor-Token"
 
@@ -130,12 +144,14 @@ ATTR_APPS_REPOSITORIES = "addons_repositories"
 ATTR_ADDR_GEN_MODE = "addr_gen_mode"
 ATTR_ADDRESS = "address"
 ATTR_ADDRESS_DATA = "address-data"
+ATTR_ADDRESSES = "addresses"
 ATTR_ADMIN = "admin"
 ATTR_ADVANCED = "advanced"
 ATTR_APPARMOR = "apparmor"
 ATTR_APPLICATION = "application"
 ATTR_ARCH = "arch"
 ATTR_ARGS = "args"
+ATTR_ALL_FEATURES = "all_features"
 ATTR_AUDIO = "audio"
 ATTR_AUDIO_INPUT = "audio_input"
 ATTR_AUDIO_OUTPUT = "audio_output"
@@ -175,6 +191,8 @@ ATTR_CONTENT_TRUST = "content_trust"
 ATTR_COUNTRY = "country"
 ATTR_CPE = "cpe"
 ATTR_CPU_PERCENT = "cpu_percent"
+ATTR_CPU_SYSTEM_USAGE = "cpu_system_usage"
+ATTR_CPU_USAGE = "cpu_usage"
 ATTR_CURRENT_VERSION = "current_version"
 ATTR_DATA = "data"
 ATTR_DATE = "date"
@@ -223,6 +241,7 @@ ATTR_FREQUENCY = "frequency"
 ATTR_FULL_ACCESS = "full_access"
 ATTR_GATEWAY = "gateway"
 ATTR_GPIO = "gpio"
+ATTR_GROUP_IDS = "group_ids"
 ATTR_HASSIO_API = "hassio_api"
 ATTR_HASSIO_ROLE = "hassio_role"
 ATTR_HASSOS = "hassos"
@@ -298,6 +317,8 @@ ATTR_NETWORK_DESCRIPTION = "network_description"
 ATTR_NETWORK_RX = "network_rx"
 ATTR_NETWORK_TX = "network_tx"
 ATTR_OBSERVER = "observer"
+ATTR_ONE_SHOT = "one_shot"
+ATTR_ONLINE_CPUS = "online_cpus"
 ATTR_OPERATING_SYSTEM = "operating_system"
 ATTR_OPTIONS = "options"
 ATTR_OTA = "ota"
@@ -321,6 +342,7 @@ ATTR_PRIVILEGED = "privileged"
 ATTR_PROTECTED = "protected"
 ATTR_PROVIDERS = "providers"
 ATTR_PSK = "psk"
+ATTR_PSK_SET = "psk_set"
 ATTR_PWNED = "pwned"
 ATTR_RATING = "rating"
 ATTR_READY = "ready"
@@ -434,10 +456,31 @@ REPOSITORY_CORE = "core"
 REPOSITORY_LOCAL = "local"
 
 FOLDER_HOMEASSISTANT = "homeassistant"
-FOLDER_SHARE = "share"
+# Legacy v1 name, kept for v1 API/backup compatibility. Replaced by Folder.APPS.
 FOLDER_ADDONS = "addons/local"
-FOLDER_SSL = "ssl"
-FOLDER_MEDIA = "media"
+
+
+class Folder(StrEnum):
+    """Backup folder enum."""
+
+    SHARE = "share"
+    APPS = "apps/local"
+    SSL = "ssl"
+    MEDIA = "media"
+
+    def origin_dir(self, config: CoreConfig) -> Path:
+        """Return the on-disk path backing this folder."""
+        match self:
+            case Folder.SHARE:
+                return config.path_share
+            case Folder.APPS:
+                return config.path_apps_local
+            case Folder.SSL:
+                return config.path_ssl
+            case Folder.MEDIA:
+                return config.path_media
+        raise ValueError(f"Unknown folder: {self}")
+
 
 SECURITY_PROFILE = "profile"
 SECURITY_DEFAULT = "default"
@@ -546,6 +589,7 @@ class HostFeature(StrEnum):
     HASSOS = "hassos"
     HOSTNAME = "hostname"
     NETWORK = "network"
+    NTP = "ntp"
     REBOOT = "reboot"
     SERVICES = "services"
     SHUTDOWN = "shutdown"
@@ -575,8 +619,13 @@ class CpuArch(StrEnum):
 class FeatureFlag(StrEnum):
     """Development features that can be toggled."""
 
+    APP_DROP_NET_RAW = "app_drop_net_raw"
+    APP_REDUCED_CAPABILITIES = "app_reduced_capabilities"
     SUPERVISOR_V2_API = "supervisor_v2_api"
     SUPERVISOR_WEBSOCKET_V2_API = "supervisor_websocket_v2_api"
+
+
+HOMEASSISTANT_GROUP_ID_ADMIN = "system-admin"
 
 
 @dataclass
@@ -596,6 +645,21 @@ class HomeAssistantUser:
     local_only: bool = False
     system_generated: bool = False
     group_ids: list[str] | None = None
+
+    @property
+    def is_admin(self) -> bool:
+        """Return if the user is an admin, mirroring Core's User.is_admin."""
+        return self.is_owner or (
+            self.is_active and HOMEASSISTANT_GROUP_ID_ADMIN in (self.group_ids or [])
+        )
+
+    @property
+    def effective_group_ids(self) -> list[str]:
+        """Return the group IDs, with the admin group folded in for owners."""
+        groups = list(self.group_ids or [])
+        if self.is_admin and HOMEASSISTANT_GROUP_ID_ADMIN not in groups:
+            groups.insert(0, HOMEASSISTANT_GROUP_ID_ADMIN)
+        return groups
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
@@ -657,6 +721,13 @@ STARTING_STATES = [
     CoreState.STARTUP,
     CoreState.SETUP,
 ]
+
+# Bounds waiting for the peer's close acknowledgment, must stay well below
+# the stage timeouts of Core.stop()
+WEBSOCKET_CLOSE_TIMEOUT = 5
+
+# States in which the Supervisor is shutting down (see Core.stop())
+STOPPING_STATES = frozenset({CoreState.STOPPING, CoreState.CLOSE})
 
 # States in which the API can be used (enforced by system_validation())
 VALID_API_STATES = frozenset(

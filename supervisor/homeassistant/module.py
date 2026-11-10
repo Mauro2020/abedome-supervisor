@@ -11,10 +11,11 @@ from typing import Any
 from uuid import UUID
 
 from awesomeversion import AwesomeVersion, AwesomeVersionException
-from securetar import AddFileError, SecureTarFile, atomic_contents_add
+from securetar import AddFileError, SecureTarError, SecureTarFile, atomic_contents_add
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
+from ..brand import ABEDOME_CORE_IMAGE
 from ..const import (
     ATTR_ACCESS_TOKEN,
     ATTR_AUDIO_INPUT,
@@ -77,6 +78,10 @@ HOMEASSISTANT_BACKUP_EXCLUDE_DATABASE = [
     "home-assistant_v?.db",
     "home-assistant_v?.db-wal",
 ]
+
+
+# Supervisor listens for Core in this subfolder of its own run folder
+RUN_SUPERVISOR_CORE = PurePath("core")
 
 
 class HomeAssistant(FileConfiguration, CoreSysAttributes):
@@ -167,16 +172,25 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         self._http_server_host = value
 
     @property
+    def api_authority(self) -> str:
+        """Return host with port for Home Assistant URLs.
+
+        The port is left out when it is the default one for the scheme, so
+        URLs stay in the form users see them in.
+        """
+        if self.api_port == (443 if self.api_ssl else 80):
+            return str(self.ip_address)
+        return f"{self.ip_address}:{self.api_port}"
+
+    @property
     def api_url(self) -> str:
         """Return API url to Home Assistant."""
-        return (
-            f"{'https' if self.api_ssl else 'http'}://{self.ip_address}:{self.api_port}"
-        )
+        return f"{'https' if self.api_ssl else 'http'}://{self.api_authority}"
 
     @property
     def ws_url(self) -> str:
         """Return API url to Home Assistant."""
-        return f"{'wss' if self.api_ssl else 'ws'}://{self.ip_address}:{self.api_port}/api/websocket"
+        return f"{'wss' if self.api_ssl else 'ws'}://{self.api_authority}/api/websocket"
 
     @property
     def watchdog(self) -> bool:
@@ -196,7 +210,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
     @property
     def default_image(self) -> str:
         """Return the default image for this system."""
-        return f"ghcr.io/home-assistant/{self.sys_machine}-homeassistant"
+        return ABEDOME_CORE_IMAGE
 
     @property
     def image(self) -> str:
@@ -220,15 +234,15 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         self._data[ATTR_OVERRIDE_IMAGE] = value
 
     @property
-    def install_image(self) -> str | None:
+    def install_image(self) -> str:
         """Return image to pull when installing or updating Home Assistant Core.
 
         Uses the user-overridden image if set, otherwise the image from the
-        update information.
+        update information, falling back to the default image for this system.
         """
         if self.override_image:
             return self.image
-        return self.sys_updater.image_homeassistant
+        return self.sys_updater.image_homeassistant or self.default_image
 
     @property
     def version(self) -> AwesomeVersion | None:
@@ -286,6 +300,24 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         return PurePath(self.sys_config.path_extern_tmp, "homeassistant_pulse")
 
     @property
+    def path_run_supervisor(self) -> Path:
+        """Return folder of the socket Supervisor listens on for Core."""
+        return self.sys_config.path_run_supervisor / RUN_SUPERVISOR_CORE
+
+    @property
+    def path_extern_run_supervisor(self) -> PurePath:
+        """Return folder of the socket Supervisor listens on for Core for Docker."""
+        return PurePath(self.sys_config.path_extern_run_supervisor, RUN_SUPERVISOR_CORE)
+
+    def ensure_run_dirs(self) -> None:
+        """Create the run folders Core's socket mounts need.
+
+        Must be run in executor.
+        """
+        self.sys_config.path_run_core.mkdir(parents=True, exist_ok=True)
+        self.path_run_supervisor.mkdir(parents=True, exist_ok=True)
+
+    @property
     def audio_output(self) -> str | None:
         """Return a pulse profile for output or None."""
         return self._data[ATTR_AUDIO_OUTPUT]
@@ -335,6 +367,11 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
 
     async def load(self) -> None:
         """Prepare Home Assistant object."""
+        # Core attaches during load and fires its initial container state
+        self.sys_bus.register_event(
+            BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
+            self._api.container_state_changed,
+        )
         await asyncio.wait(
             [
                 self.sys_create_task(self.websocket.load()),
@@ -344,10 +381,6 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         )
 
         # Register for events
-        self.sys_bus.register_event(
-            BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
-            self._api.container_state_changed,
-        )
         self.sys_bus.register_event(BusEvent.HARDWARE_NEW_DEVICE, self._hardware_events)
         self.sys_bus.register_event(
             BusEvent.HARDWARE_REMOVE_DEVICE, self._hardware_events
@@ -524,7 +557,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                             path=temp_path,
                             filter="tar",
                         )
-                except tarfile.FilterError as err:
+                except (tarfile.FilterError, SecureTarError) as err:
                     raise BackupInvalidError(
                         f"Invalid tarfile {tar_file}: {err}", _LOGGER.error
                     ) from err

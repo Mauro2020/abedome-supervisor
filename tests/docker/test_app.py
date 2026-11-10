@@ -15,18 +15,24 @@ from supervisor.apps import validate as vd
 from supervisor.apps.app import App
 from supervisor.apps.model import Data
 from supervisor.apps.options import AppOptions
-from supervisor.const import BusEvent
+from supervisor.const import BusEvent, FeatureFlag
 from supervisor.coresys import CoreSys
 from supervisor.dbus.agent.cgroup import CGroup
 from supervisor.docker.app import DockerApp
 from supervisor.docker.const import (
+    Capabilities,
     DockerMount,
     MountBindOptions,
     MountType,
     PropagationMode,
 )
 from supervisor.docker.manager import DockerAPI
-from supervisor.exceptions import CoreDNSError, DockerNotFound, DockerTimeoutError
+from supervisor.exceptions import (
+    CoreDNSError,
+    DockerError,
+    DockerNotFound,
+    DockerTimeoutError,
+)
 from supervisor.hardware.data import Device
 from supervisor.host.const import HostFeature
 from supervisor.os.manager import OSManager
@@ -92,6 +98,27 @@ def test_base_volumes_included(coresys: CoreSys, addonsdata_system: dict[str, Da
         )
         in docker_app.mounts
     )
+
+
+def test_legacy_app_environment_does_not_modify_app_data(
+    coresys: CoreSys,
+    addonsdata_system: dict[str, Data],
+    addonsdata_user: PropertyMock,
+):
+    """Legacy app options are added to the env without changing stored app data."""
+    config = load_json_fixture("basic-app-config.json")
+    config["legacy"] = True
+    config["environment"] = {"MY_ENV": "value"}
+    config["options"] = {"port": 8080, "name": "test"}
+    docker_app = get_docker_app(coresys, addonsdata_system, config)
+    addonsdata_user.return_value = {"test_addon": {"options": {}}}
+
+    environment = docker_app.environment
+
+    assert environment["MY_ENV"] == "value"
+    assert environment["port"] == 8080
+    assert environment["name"] == "test"
+    assert docker_app.app.data["environment"] == {"MY_ENV": "value"}
 
 
 @pytest.mark.usefixtures("path_extern")
@@ -975,16 +1002,40 @@ async def test_app_build_inspect_timeout(
         await docker_app.install(docker_app.version, need_build=True)
 
 
+@pytest.mark.parametrize(
+    ("side_effect", "expected_error", "match"),
+    [
+        pytest.param(
+            TimeoutError(),
+            DockerTimeoutError,
+            "Timeout writing to .* stdin",
+            id="timeout",
+        ),
+        pytest.param(
+            RuntimeError("Cannot write to closed transport"),
+            DockerError,
+            "Can't write to .* stdin",
+            id="generic-error",
+        ),
+    ],
+)
 @pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
-async def test_app_write_stdin_get_timeout(
-    coresys: CoreSys, addonsdata_system: dict[str, Data]
+async def test_app_write_stdin_error_closes_stream(
+    coresys: CoreSys,
+    addonsdata_system: dict[str, Data],
+    side_effect: Exception,
+    expected_error: type[DockerError],
+    match: str,
 ):
-    """Test write_stdin raises DockerTimeoutError when containers.get times out."""
+    """Test write_stdin maps write errors and still closes the attach stream."""
     docker_app = get_docker_app(coresys, addonsdata_system, "basic-app-config.json")
-    coresys.docker.containers.get.side_effect = TimeoutError()
+    attach_stream = coresys.docker.containers.container.return_value.attach.return_value
+    attach_stream.write_in.side_effect = side_effect
 
-    with pytest.raises(DockerTimeoutError, match="Timeout attaching to .* stdin"):
+    with pytest.raises(expected_error, match=match):
         await docker_app.write_stdin(b"hello")
+
+    attach_stream.__aexit__.assert_awaited_once()
 
 
 @pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
@@ -1008,3 +1059,97 @@ async def test_app_hardware_events_get_timeout(
             DockerTimeoutError, match="Timeout processing Hardware Event"
         ):
             await fire_bus_event(coresys, BusEvent.HARDWARE_NEW_DEVICE, TEST_HW_DEVICE)
+
+
+@pytest.mark.parametrize(
+    ("flags", "privileged", "expected_drop"),
+    [
+        pytest.param([], [], None, id="no-flags"),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW], [], [Capabilities.NET_RAW], id="net-raw"
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW],
+            ["SYS_TIME"],
+            [Capabilities.NET_RAW],
+            id="net-raw-unrelated-privilege",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW], ["NET_RAW"], None, id="net-raw-requested"
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW],
+            ["NET_ADMIN"],
+            [Capabilities.NET_RAW],
+            id="net-raw-not-implied-by-net-admin",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_REDUCED_CAPABILITIES],
+            [],
+            [Capabilities.AUDIT_WRITE, Capabilities.MKNOD, Capabilities.SETFCAP],
+            id="reduced",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_REDUCED_CAPABILITIES],
+            ["MKNOD"],
+            [Capabilities.AUDIT_WRITE, Capabilities.SETFCAP],
+            id="reduced-mknod-requested",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_REDUCED_CAPABILITIES],
+            ["NET_RAW"],
+            [Capabilities.AUDIT_WRITE, Capabilities.MKNOD, Capabilities.SETFCAP],
+            id="reduced-keeps-net-raw",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW, FeatureFlag.APP_REDUCED_CAPABILITIES],
+            [],
+            [
+                Capabilities.NET_RAW,
+                Capabilities.AUDIT_WRITE,
+                Capabilities.MKNOD,
+                Capabilities.SETFCAP,
+            ],
+            id="both-flags",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW, FeatureFlag.APP_REDUCED_CAPABILITIES],
+            ["NET_RAW", "AUDIT_WRITE", "MKNOD", "SETFCAP"],
+            None,
+            id="both-flags-all-requested",
+        ),
+    ],
+)
+async def test_dropped_capabilities_feature_flags(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    flags: list[FeatureFlag],
+    privileged: list[str],
+    expected_drop: list[Capabilities] | None,
+):
+    """Test capabilities are dropped per feature flag unless the app requests them."""
+    docker_app = DockerApp(coresys, install_app_ssh)
+    install_app_ssh.data["privileged"] = privileged
+    for flag in flags:
+        coresys.config.set_feature_flag(flag, True)
+
+    assert docker_app.dropped_capabilities == expected_drop
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_run_drops_net_raw_with_feature_flag(
+    coresys: CoreSys, install_app_ssh: App
+):
+    """Test the container is created with NET_RAW dropped when the flag is set."""
+    coresys.config.set_feature_flag(FeatureFlag.APP_DROP_NET_RAW, True)
+    docker_app = DockerApp(coresys, install_app_ssh)
+
+    with (
+        patch.object(DockerAPI, "run", return_value=MagicMock()) as run,
+        patch.object(DockerApp, "is_running", return_value=False),
+        patch.object(DockerApp, "stop"),
+    ):
+        await docker_app.run()
+
+    assert run.call_args.kwargs["cap_add"] is None
+    assert run.call_args.kwargs["cap_drop"] == [Capabilities.NET_RAW]

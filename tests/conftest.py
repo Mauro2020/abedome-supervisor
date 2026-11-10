@@ -4,8 +4,10 @@ import asyncio
 from collections.abc import AsyncGenerator, Generator
 from datetime import datetime
 from pathlib import Path
+import shutil
 import subprocess
-from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock, patch
+import tempfile
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, patch
 from uuid import uuid4
 
 from aiodocker.channel import Channel, ChannelSubscriber
@@ -16,11 +18,11 @@ from aiodocker.execs import Exec
 from aiodocker.networks import DockerNetwork, DockerNetworks
 from aiodocker.system import DockerSystem
 from aiodocker.volumes import DockerVolumes
-from aiohttp import ClientSession, web
+from aiohttp import ClientSession, web, web_app as aiohttp_web_app
 from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
 from blockbuster import BlockBuster, BlockBusterFunction
-from dbus_fast import BusType
+from dbus_fast import BusType, Variant
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 from securetar import SecureTarArchive
@@ -51,6 +53,7 @@ from supervisor.const import (
     CpuArch,
 )
 from supervisor.coresys import CoreSys
+from supervisor.dbus.agent import OSAgent
 from supervisor.dbus.network import NetworkManager
 from supervisor.docker.manager import DockerAPI
 from supervisor.exceptions import HostLogError
@@ -64,6 +67,7 @@ from supervisor.utils.dt import utcnow
 from .common import (
     AsyncIterator,
     MockResponse,
+    api_record_middleware,
     load_fixture,
     load_json_fixture,
     mock_dbus_services,
@@ -82,6 +86,16 @@ from .dbus_service_mocks.network_dns_manager import DnsManager as DnsManagerServ
 from .dbus_service_mocks.network_manager import NetworkManager as NetworkManagerService
 
 # pylint: disable=redefined-outer-name, protected-access
+
+APPS_FIXTURES = Path(__file__).parent / "fixtures" / "apps"
+
+
+def _snapshot_tree(path: Path) -> dict[Path, tuple[int, int]]:
+    """Return inode and mtime of every entry below path."""
+    return {
+        entry: (entry.stat().st_ino, entry.stat().st_mtime_ns)
+        for entry in path.rglob("*")
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -107,6 +121,28 @@ def blockbuster(request: pytest.FixtureRequest) -> BlockBuster | None:
     blockbuster.activate()
     yield blockbuster
     blockbuster.deactivate()
+
+
+@pytest.fixture(autouse=True)
+def _clear_aiohttp_middleware_cache() -> Generator[None]:
+    """Clear aiohttp's process-wide middleware-build cache after each test.
+
+    ``aiohttp.web_app._build_middlewares`` is memoized via a module-level
+    ``functools.lru_cache(maxsize=1024)`` (``_cached_build_middleware``)
+    keyed on the route handler and the chain of ``Application`` instances
+    involved. This test suite builds a fresh ``RestAPI``/``web.Application``
+    (with route handlers bound to a fresh ``CoreSys``) for nearly every
+    test, so each test populates new cache entries that are never reused by
+    later tests. Left uncleared, up to 1024 stale entries accumulate over a
+    full test run, each one pinning an entire ``CoreSys`` object graph
+    (docker mocks, D-Bus proxies, aiohttp routes, etc.) in memory - causing
+    steady memory growth that can OOM long/full suite runs. Use ``getattr``
+    defensively since this reaches into an aiohttp private implementation
+    detail that could change/disappear in a future aiohttp release.
+    """
+    yield
+    if cache := getattr(aiohttp_web_app, "_cached_build_middleware", None):
+        cache.cache_clear()
 
 
 @pytest.fixture
@@ -230,11 +266,28 @@ async def docker() -> DockerAPI:
         docker_containers.get.return_value = docker_container = MagicMock(
             spec=DockerContainer, id=container_inspect["Id"]
         )
+        # container() is the sync, no-I/O counterpart to get(); alias it to
+        # the same mock so callers get consistent container state either way.
+        docker_containers.container.return_value = docker_container
         docker_containers.list.return_value = [docker_container]
         docker_containers.create.return_value = docker_container
         docker_container.show.return_value = container_inspect
         docker_container.wait.return_value = {"StatusCode": 0}
         docker_container.log = AsyncMock(return_value=[])
+        # Default stats response looks like Docker's stub for a stopped
+        # container (no online_cpus in cpu_stats), matching the default
+        # "stopped" state above. Tests for a running container should
+        # override this with a full stats payload.
+        docker_container.stats = AsyncMock(
+            return_value=[
+                {
+                    "id": container_inspect["Id"],
+                    "name": "mycontainer",
+                    "cpu_stats": {"cpu_usage": {"total_usage": 0}},
+                    "memory_stats": {},
+                }
+            ]
+        )
 
         docker_container.exec.return_value = docker_exec = MagicMock(spec=Exec)
         # start() with detach=False returns a Stream (not async)
@@ -243,8 +296,11 @@ async def docker() -> DockerAPI:
         docker_exec.inspect.return_value = {"ExitCode": 0}
 
         # Load Docker manager
+        loop = asyncio.get_running_loop()
         docker_obj = await DockerAPI(
-            MagicMock(create_task=asyncio.get_running_loop().create_task)
+            MagicMock(
+                create_task=loop.create_task, create_background_task=loop.create_task
+            )
         ).post_init()
         docker_obj.config._data = {"registries": {}}
         await docker_obj.load()
@@ -378,6 +434,29 @@ async def fixture_connection_settings_service(
     ]
 
 
+@pytest.fixture(name="imported_wifi_settings_service")
+async def fixture_imported_wifi_settings_service(
+    network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
+    dbus_session_bus: MessageBus,
+) -> ConnectionSettingsService:
+    """Store an inactive wifi profile like one the installer writes into CONFIG."""
+    service = (
+        await mock_dbus_services(
+            {
+                "network_connection_settings": "/org/freedesktop/NetworkManager/Settings/3"
+            },
+            dbus_session_bus,
+        )
+    )["network_connection_settings"]
+    service.settings["connection"]["id"] = Variant("s", "my-network")
+    service.settings["connection"]["type"] = Variant("s", "802-11-wireless")
+    service.settings["user"] = {
+        "data": Variant("a{ss}", {"io.home-assistant.import": "supervisor"})
+    }
+    network_manager_services["network_settings"].connections.append(service.object_path)
+    return service
+
+
 @pytest.fixture(name="udisks2_services")
 async def fixture_udisks2_services(
     dbus_session_bus: MessageBus,
@@ -395,18 +474,22 @@ async def fixture_udisks2_services(
                 "/org/freedesktop/UDisks2/block_devices/sda1",
                 "/org/freedesktop/UDisks2/block_devices/sdb",
                 "/org/freedesktop/UDisks2/block_devices/sdb1",
+                "/org/freedesktop/UDisks2/block_devices/sdc",
+                "/org/freedesktop/UDisks2/block_devices/sdc1",
                 "/org/freedesktop/UDisks2/block_devices/zram1",
             ],
             "udisks2_drive": [
                 "/org/freedesktop/UDisks2/drives/BJTD4R_0x97cde291",
                 "/org/freedesktop/UDisks2/drives/Generic_Flash_Disk_61BCDDB6",
                 "/org/freedesktop/UDisks2/drives/SSK_SSK_Storage_DF56419883D56",
+                "/org/freedesktop/UDisks2/drives/Seagate_Expansion_1234567890",
             ],
             "udisks2_filesystem": [
                 "/org/freedesktop/UDisks2/block_devices/mmcblk1p1",
                 "/org/freedesktop/UDisks2/block_devices/mmcblk1p3",
                 "/org/freedesktop/UDisks2/block_devices/sda1",
                 "/org/freedesktop/UDisks2/block_devices/sdb1",
+                "/org/freedesktop/UDisks2/block_devices/sdc1",
                 "/org/freedesktop/UDisks2/block_devices/zram1",
             ],
             "udisks2_loop": None,
@@ -416,6 +499,7 @@ async def fixture_udisks2_services(
                 "/org/freedesktop/UDisks2/block_devices/mmcblk1",
                 "/org/freedesktop/UDisks2/block_devices/sda",
                 "/org/freedesktop/UDisks2/block_devices/sdb",
+                "/org/freedesktop/UDisks2/block_devices/sdc",
             ],
             "udisks2_partition": [
                 "/org/freedesktop/UDisks2/block_devices/mmcblk1p1",
@@ -423,10 +507,36 @@ async def fixture_udisks2_services(
                 "/org/freedesktop/UDisks2/block_devices/mmcblk1p3",
                 "/org/freedesktop/UDisks2/block_devices/sda1",
                 "/org/freedesktop/UDisks2/block_devices/sdb1",
+                "/org/freedesktop/UDisks2/block_devices/sdc1",
             ],
         },
         dbus_session_bus,
     )
+
+
+@pytest.fixture(name="sdc_candidate")
+async def fixture_sdc_candidate(
+    coresys: CoreSys,
+    udisks2_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
+) -> DBusServiceMock:
+    """Make the unmounted sdc1 disk visible to UDisks2 enumeration.
+
+    sdc/sdc1 are mocked but omitted from the manager's default block list so
+    other tests still see an unchanged host. Request this fixture to opt in.
+
+    Returns the sdc1 block service; mutate `.fixture` and call
+    `coresys.dbus.udisks2.update()` to re-read changed properties.
+    """
+    udisks2_manager = udisks2_services["udisks2_manager"]
+    udisks2_manager.block_devices = udisks2_manager.block_devices + [
+        "/org/freedesktop/UDisks2/block_devices/sdc",
+        "/org/freedesktop/UDisks2/block_devices/sdc1",
+    ]
+    await coresys.dbus.udisks2.update()
+
+    return udisks2_services["udisks2_block"][
+        "/org/freedesktop/UDisks2/block_devices/sdc1"
+    ]
 
 
 @pytest.fixture(name="os_agent_services")
@@ -442,6 +552,7 @@ async def fixture_os_agent_services(
             "agent_datadisk": None,
             "agent_swap": None,
             "agent_system": None,
+            "agent_timesyncd": None,
             "agent_boards": None,
             "agent_boards_rpi_firmware": None,
             "agent_boards_yellow": None,
@@ -548,12 +659,14 @@ async def coresys(
     coresys_obj.supervisor._connectivity = True
     coresys_obj.host.network._connectivity = True
 
-    # Fix Paths
-    su_config.APPS_CORE = Path(Path(__file__).parent.joinpath("fixtures"), "apps/core")
-    su_config.APPS_LOCAL = Path(
-        Path(__file__).parent.joinpath("fixtures"), "apps/local"
-    )
-    su_config.APPS_GIT = Path(Path(__file__).parent.joinpath("fixtures"), "apps/git")
+    # Fix Paths. Select the apps fixtures before any fixture loads the store,
+    # as repositories and store apps cache their location.
+    apps_fixtures = APPS_FIXTURES
+    if "apps_fixtures_copy" in request.fixturenames:
+        apps_fixtures = request.getfixturevalue("apps_fixtures_copy")
+    su_config.APPS_CORE = apps_fixtures / "core"
+    su_config.APPS_LOCAL = apps_fixtures / "local"
+    su_config.APPS_GIT = apps_fixtures / "git"
     su_config.APPARMOR_DATA = Path(
         Path(__file__).parent.joinpath("fixtures"), "apparmor"
     )
@@ -570,10 +683,25 @@ async def coresys(
         coresys_obj.init_websession = AsyncMock()
 
     # Don't remove files/folders related to apps and stores
+    apps_fixtures_before = await coresys_obj.run_in_executor(
+        _snapshot_tree, APPS_FIXTURES
+    )
     with patch("supervisor.store.git.GitRepo.remove"):
         yield coresys_obj
 
     await coresys_obj.dbus.unload()
+
+    # The apps fixtures are shared with concurrent xdist workers. A test that
+    # writes there (e.g. restoring a backup of the local apps folder) must use
+    # apps_fixtures_copy, or other workers read a half-rewritten store.
+    apps_fixtures_after = await coresys_obj.run_in_executor(
+        _snapshot_tree, APPS_FIXTURES
+    )
+    if apps_fixtures_after != apps_fixtures_before:
+        pytest.fail(
+            f"Test modified the shared apps fixtures in {APPS_FIXTURES}, "
+            "use the apps_fixtures_copy fixture"
+        )
 
 
 @pytest.fixture
@@ -588,15 +716,36 @@ async def ha_ws_client(coresys: CoreSys) -> AsyncMock:
 
 
 @pytest.fixture
-async def tmp_supervisor_data(coresys: CoreSys, tmp_path: Path) -> Path:
-    """Patch supervisor data to be tmp_path."""
+def apps_fixtures_copy(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Create a private copy of the apps fixtures for the app store paths.
+
+    Required by tests that write to path_apps_local, path_apps_core or
+    path_apps_git. The coresys fixture points the store at this copy, in
+    whichever order the test requests the fixtures. The copy keeps the
+    fixtures/apps suffix for tests asserting on fixture paths and lives beside
+    tmp_path, which some tests use as an app location.
+    """
+    apps_fixtures = tmp_path_factory.mktemp("apps") / "fixtures" / "apps"
+    shutil.copytree(APPS_FIXTURES, apps_fixtures)
+    return apps_fixtures
+
+
+@pytest.fixture
+async def tmp_supervisor_data(
+    coresys: CoreSys, tmp_path: Path, apps_fixtures_copy: Path
+) -> Path:
+    """Patch supervisor data to be tmp_path.
+
+    Backup and restore tests need this layout and may restore the local apps
+    folder, so they also get a private copy of the apps fixtures.
+    """
     with patch.object(
         su_config.CoreConfig, "path_supervisor", new=PropertyMock(return_value=tmp_path)
     ):
-        coresys.config.path_emergency.mkdir()
         coresys.config.path_media.mkdir()
         coresys.config.path_mounts.mkdir()
         coresys.config.path_mounts_credentials.mkdir()
+        coresys.config.path_mounts_devices.mkdir()
         coresys.config.path_backup.mkdir()
         coresys.config.path_tmp.mkdir()
         coresys.config.path_homeassistant.mkdir()
@@ -609,6 +758,23 @@ async def tmp_supervisor_data(coresys: CoreSys, tmp_path: Path) -> Path:
         coresys.config.path_core_backup.mkdir(parents=True)
         coresys.config.path_cid_files.mkdir()
         yield tmp_path
+
+
+@pytest.fixture
+def tmp_run_dir() -> Generator[Path]:
+    """Patch the shared run folder for sockets to a temporary folder.
+
+    Short enough for sun_path (pytest's tmp_path is too long on macOS).
+    """
+    with (
+        tempfile.TemporaryDirectory(dir="/tmp") as tmp_dir,  # noqa: S108
+        patch.object(
+            su_config.CoreConfig,
+            "path_run",
+            new=PropertyMock(return_value=Path(tmp_dir)),
+        ),
+    ):
+        yield Path(tmp_dir)
 
 
 @pytest.fixture
@@ -693,7 +859,9 @@ async def api_client(
         return await handler(request)
 
     api = RestAPI(coresys)
-    api.webapp = web.Application(middlewares=[_security_middleware])
+    api.webapp = web.Application(
+        middlewares=[api_record_middleware(), _security_middleware]
+    )
     api.start = AsyncMock()
     await api.load()
     return await aiohttp_client(api.webapp)
@@ -709,13 +877,8 @@ def supervisor_internet(coresys: CoreSys) -> AsyncMock:
 
 @pytest.fixture
 def websession(coresys: CoreSys) -> MagicMock:
-    """Fixture for global aiohttp SessionClient.
-
-    Also mocks Core container is_running to return True so that
-    make_request doesn't bail before reaching the websession.
-    """
+    """Fixture for global aiohttp SessionClient."""
     coresys._websession = MagicMock(spec_set=ClientSession)
-    coresys.homeassistant.core.instance.is_running = AsyncMock(return_value=True)
     return coresys._websession
 
 
@@ -897,6 +1060,10 @@ async def journald_logs(coresys: CoreSys) -> MagicMock:
         ),
         patch.object(LogsControl, "journald_logs", new=MagicMock()) as logs,
     ):
+        # The reader enters the response a second time; its reads must end
+        # like an empty stream, a MagicMock chunk keeps it looping forever
+        response = logs.return_value.__aenter__.return_value
+        response.__aenter__.return_value.content.read.return_value = b""
         await coresys.host.logs.load()
         yield logs
 
@@ -929,6 +1096,18 @@ async def capture_message() -> Mock:
         patch("supervisor.utils.sentry.sentry_sdk.capture_message") as capture_message,
     ):
         yield capture_message
+
+
+@pytest.fixture
+async def os_agent_version(request: pytest.FixtureRequest) -> None:
+    """Mock OS Agent version."""
+    version = (
+        AwesomeVersion(request.param)
+        if hasattr(request, "param")
+        else AwesomeVersion("1.9.0")
+    )
+    with patch.object(OSAgent, "version", new=PropertyMock(return_value=version)):
+        yield
 
 
 @pytest.fixture
@@ -965,6 +1144,10 @@ def create_mock_exec_stream(output: bytes = b"") -> AsyncMock:
 async def container(docker: DockerAPI) -> DockerContainer:
     """Mock attrs and status for container on attach."""
     container_mock = docker.containers.get.return_value
+    # container_stats() uses containers.container() (no I/O) instead of
+    # containers.get() for the windowed stats path, so alias it to the same
+    # mock to keep both entry points in sync for tests.
+    docker.containers.container.return_value = container_mock
 
     # Set up exec mock to return a mock stream
     # Note: This must be a regular function, not async, to match aiodocker's start() behavior
@@ -1029,15 +1212,17 @@ def mock_aarch64_arch_supported(coresys: CoreSys) -> None:
 def mock_is_mount() -> MagicMock:
     """Mock the network-mount probe to report a healthy mount.
 
-    Patches `_probe_network_mount` (the executor-side syscall combo
+    Patches `_probe_mount` (the executor-side syscall combo
     of statvfs + st_dev comparison) so existing tests don't need a
     real filesystem mount to look healthy. Tests that simulate a
     broken mount override with `side_effect=OSError(...)` for the
     unreachable case or `return_value=False` for the ghost case.
     """
-    with patch(
-        "supervisor.mounts.mount._probe_network_mount", return_value=True
-    ) as probe:
+    # ANY matches every resolved device number, so a disk mount stays attached
+    with (
+        patch("supervisor.mounts.mount._probe_mount", return_value=True) as probe,
+        patch("supervisor.mounts.mount._mount_device_number", return_value=ANY),
+    ):
         yield probe
 
 
@@ -1046,3 +1231,14 @@ def no_job_throttle():
     """Remove job throttle for tests."""
     with patch("supervisor.jobs.decorator.Job.last_call", return_value=datetime.min):
         yield
+
+
+@pytest.fixture
+async def loop_exception_handler() -> AsyncGenerator[Mock]:
+    """Capture reports to the event loop's exception handler."""
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    handler = Mock()
+    loop.set_exception_handler(handler)
+    yield handler
+    loop.set_exception_handler(previous_handler)

@@ -1,8 +1,11 @@
 """Test Home Assistant OS functionality."""
 
+import asyncio
+import errno
 from pathlib import Path
-from unittest.mock import AsyncMock, PropertyMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
+import aiohttp
 from awesomeversion import AwesomeVersion
 from dbus_fast import Variant
 import pytest
@@ -10,7 +13,11 @@ import pytest
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
 from supervisor.dbus.const import RaucState
-from supervisor.exceptions import HassOSJobError, HassOSUpdateError
+from supervisor.exceptions import (
+    HassOSJobError,
+    HassOSUpdateError,
+    HassOSUpdatePendingRebootError,
+)
 from supervisor.resolution.const import (
     ContextType,
     IssueType,
@@ -32,7 +39,9 @@ async def test_ota_url_generic_x86_64_rename(
     """Test download URL generated."""
     coresys.os._board = "intel-nuc"
     coresys.os._version = AwesomeVersion("5.13")
-    await coresys.updater.fetch_data()
+    task = await coresys.updater.fetch_data()
+    assert task
+    await task
 
     version6 = AwesomeVersion("6.0")
     url = coresys.updater.ota_url.format(
@@ -158,6 +167,47 @@ async def test_update_success_cleans_up_bundle(
     assert coresys.os.need_update is False
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(aiohttp.ClientPayloadError("connection reset"), id="client"),
+        pytest.param(TimeoutError(), id="timeout"),
+        pytest.param(OSError(errno.ENOSPC, "No space left on device"), id="os"),
+    ],
+)
+@pytest.mark.usefixtures("path_extern", "supervisor_internet")
+async def test_update_download_failure_removes_partial_bundle(
+    coresys: CoreSys,
+    tmp_supervisor_data: Path,
+    websession: MagicMock,
+    error: Exception,
+) -> None:
+    """Test a failed OTA download removes the partially written bundle."""
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    coresys.os._available = True
+    coresys.os._board = "generic-x86-64"
+    coresys.os._os_name = "haos"
+    coresys.os._version = AwesomeVersion("12.0")
+    coresys.updater._data = {
+        "ota": (
+            "https://github.com/home-assistant/operating-system/releases/download/"
+            "{version}/{os_name}_{board}-{version}.raucb"
+        ),
+        "hassos_unrestricted": AwesomeVersion("13.0"),
+    }
+
+    response = MockResponse()
+    response.content = MagicMock()
+    response.content.read = AsyncMock(side_effect=[b"partial", error])
+    websession.get = MagicMock(return_value=response)
+
+    with pytest.raises(HassOSUpdateError, match="Can't (fetch OTA update|write OTA)"):
+        await coresys.os.update()
+
+    assert not (coresys.config.path_tmp / "hassos-13.0.raucb").exists()
+
+
 async def test_update_pending_version_blocked(
     coresys: CoreSys,
     tmp_supervisor_data: Path,
@@ -187,7 +237,7 @@ async def test_update_pending_version_blocked(
     ) as download:
         await coresys.os.update()
 
-        with pytest.raises(HassOSUpdateError):
+        with pytest.raises(HassOSUpdatePendingRebootError):
             await coresys.os.update()
 
     download.assert_called_once()
@@ -454,3 +504,55 @@ async def test_config_sync_service_name(
         await coresys.os.config_sync()
 
     restart.assert_called_once_with(expected_service)
+
+
+@pytest.mark.usefixtures("os_available")
+async def test_ssh_authorized_keys_jobs_serialized(coresys: CoreSys):
+    """Test concurrent SSH key add and clear do not interleave.
+
+    Interleaved file and service operations could end with the service
+    state not matching the key state (e.g. a key configured but dropbear
+    stopped).
+    """
+    events: list[str] = []
+
+    def record(name: str):
+        async def _record(*args):
+            events.append(f"{name}-begin")
+            await asyncio.sleep(0.01)
+            events.append(f"{name}-end")
+
+        return _record
+
+    with (
+        patch.object(
+            type(coresys.dbus.agent.system), "add_ssh_auth_key", new=record("add-key")
+        ),
+        patch.object(
+            type(coresys.dbus.agent.system),
+            "clear_ssh_auth_keys",
+            new=record("clear-keys"),
+        ),
+        patch.object(
+            coresys.host.services, "start", new=AsyncMock(side_effect=record("start"))
+        ),
+        patch.object(
+            coresys.host.services, "stop", new=AsyncMock(side_effect=record("stop"))
+        ),
+    ):
+        await asyncio.gather(
+            coresys.os.add_ssh_authorized_key("ssh-ed25519 AAAA test@example.com"),
+            coresys.os.clear_ssh_authorized_keys(),
+        )
+
+    # Each operation's file change and service action must be contiguous
+    assert events == [
+        "add-key-begin",
+        "add-key-end",
+        "start-begin",
+        "start-end",
+        "clear-keys-begin",
+        "clear-keys-end",
+        "stop-begin",
+        "stop-end",
+    ]

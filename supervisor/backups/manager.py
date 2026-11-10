@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
+from contextlib import suppress
 import errno
 import logging
 from pathlib import Path
@@ -11,21 +12,20 @@ from shutil import copy
 from typing import cast
 
 from ..apps.app import App
-from ..const import (
-    ATTR_DAYS_UNTIL_STALE,
-    FILE_HASSIO_BACKUPS,
-    FOLDER_HOMEASSISTANT,
-    CoreState,
-)
+from ..const import ATTR_DAYS_UNTIL_STALE, FILE_HASSIO_BACKUPS, CoreState, Folder
 from ..coresys import CoreSys
 from ..dbus.const import UnitActiveState
 from ..exceptions import (
     BackupDataDiskBadMessageError,
     BackupError,
+    BackupFileExistError,
     BackupFileNotFoundError,
     BackupInvalidError,
     BackupJobError,
     BackupMountDownError,
+    BackupSupervisorUpdateInProgressError,
+    BackupSupervisorVersionError,
+    UpdaterError,
 )
 from ..jobs.const import JOB_GROUP_BACKUP_MANAGER, JobConcurrency, JobCondition
 from ..jobs.decorator import Job
@@ -386,7 +386,7 @@ class BackupManager(FileConfiguration, JobGroup):
                 destination = self.sys_config.path_core_backup
             elif location:
                 location_mount = cast(Mount, location)
-                if not location_mount.local_where.is_mount():
+                if not await location_mount.is_mounted():
                     raise BackupMountDownError(mount=location_mount.name)
                 destination = location_mount.local_where
             else:
@@ -513,7 +513,7 @@ class BackupManager(FileConfiguration, JobGroup):
         self,
         backup: Backup,
         app_list: list[App],
-        folder_list: list[str],
+        folder_list: list[Folder],
         homeassistant: bool,
         homeassistant_exclude_database: bool | None,
         additional_locations: list[LOCATION_TYPE] | None = None,
@@ -558,6 +558,10 @@ class BackupManager(FileConfiguration, JobGroup):
 
                 self._change_stage(BackupJobStage.FINISHING_FILE, backup)
 
+        except BackupFileExistError as err:
+            # The file belongs to a different backup, it must not be removed
+            self.sys_jobs.current.capture_error(err)
+            return None
         except BackupError as err:
             await self.sys_run_in_executor(backup.tarfile.unlink, missing_ok=True)
             _LOGGER.error("Backup %s error: %s", backup.slug, err)
@@ -652,7 +656,7 @@ class BackupManager(FileConfiguration, JobGroup):
         filename: str | None = None,
         *,
         apps: list[str] | None = None,
-        folders: list[str] | None = None,
+        folders: list[Folder] | None = None,
         password: str | None = None,
         homeassistant: bool = False,
         compressed: bool = True,
@@ -675,11 +679,6 @@ class BackupManager(FileConfiguration, JobGroup):
 
         apps = apps or []
         folders = folders or []
-
-        # HomeAssistant Folder is for v1
-        if FOLDER_HOMEASSISTANT in folders:
-            folders.remove(FOLDER_HOMEASSISTANT)
-            homeassistant = True
 
         if len(apps) == 0 and len(folders) == 0 and not homeassistant:
             _LOGGER.error("Nothing to create backup for")
@@ -717,7 +716,7 @@ class BackupManager(FileConfiguration, JobGroup):
         self,
         backup: Backup,
         app_list: list[str],
-        folder_list: list[str],
+        folder_list: list[Folder],
         homeassistant: bool,
         replace: bool,
         location: str | None | type[DEFAULT],
@@ -745,7 +744,8 @@ class BackupManager(FileConfiguration, JobGroup):
                 # Delete delta apps
                 if replace:
                     self._change_stage(RestoreJobStage.REMOVE_DELTA_APPS, backup)
-                    success = success and await backup.remove_delta_apps()
+                    delta_success = await backup.remove_delta_apps()
+                    success = success and delta_success
 
                 if app_list:
                     self._change_stage(RestoreJobStage.APP_REPOSITORIES, backup)
@@ -832,6 +832,41 @@ class BackupManager(FileConfiguration, JobGroup):
 
         await backup.validate_backup(location_name)
 
+    async def _check_supervisor_version(self, backup: Backup) -> None:
+        """Check backup is not from a newer Supervisor version, raise if so."""
+        if backup.supervisor_version <= self.sys_supervisor.version:
+            return
+
+        if self.sys_updater.auto_update:
+            if not self.sys_supervisor.need_update:
+                # Ensure the latest version info is known before concluding
+                # there's no update to wait for. fetch_data is a detached,
+                # REJECT-concurrency job, so this reuses an already in-flight
+                # fetch instead of masking it behind the throttle window.
+                with suppress(UpdaterError):
+                    if task := await self.sys_updater.fetch_data():
+                        await task
+
+            # Start (or reuse) the auto update. We can't await its completion
+            # here - the update stops this very Supervisor instance once it
+            # completes, which would drop the connection before a response
+            # could be served. Use the returned task's done status instead;
+            # awaiting auto_update_supervisor() itself only waits for the
+            # update to be started (or reused), not for it to finish.
+            update_task = await self.sys_supervisor.auto_update_supervisor()
+            if update_task and not update_task.done():
+                raise BackupSupervisorUpdateInProgressError(
+                    _LOGGER.error,
+                    backup_version=backup.supervisor_version,
+                    supervisor_version=self.sys_supervisor.version,
+                )
+
+        raise BackupSupervisorVersionError(
+            _LOGGER.error,
+            backup_version=backup.supervisor_version,
+            supervisor_version=self.sys_supervisor.version,
+        )
+
     @Job(
         name=JOB_FULL_RESTORE,
         conditions=[
@@ -863,13 +898,7 @@ class BackupManager(FileConfiguration, JobGroup):
             )
 
         await self._validate_backup_location(backup, password, location)
-
-        if backup.supervisor_version > self.sys_supervisor.version:
-            raise BackupInvalidError(
-                f"Backup was made on supervisor version {backup.supervisor_version}, "
-                f"can't restore on {self.sys_supervisor.version}. Must update supervisor first.",
-                _LOGGER.error,
-            )
+        await self._check_supervisor_version(backup)
 
         # If being run in the background, notify caller that validation has completed
         if validation_complete:
@@ -916,7 +945,7 @@ class BackupManager(FileConfiguration, JobGroup):
         *,
         homeassistant: bool = False,
         apps: list[str] | None = None,
-        folders: list[str] | None = None,
+        folders: list[Folder] | None = None,
         password: str | None = None,
         location: str | None | type[DEFAULT] = DEFAULT,
         validation_complete: asyncio.Event | None = None,
@@ -928,11 +957,6 @@ class BackupManager(FileConfiguration, JobGroup):
         app_list = apps or []
         folder_list = folders or []
 
-        # Version 1
-        if FOLDER_HOMEASSISTANT in folder_list:
-            folder_list.remove(FOLDER_HOMEASSISTANT)
-            homeassistant = True
-
         await self._validate_backup_location(backup, password, location)
 
         if backup.homeassistant is None and homeassistant:
@@ -940,12 +964,7 @@ class BackupManager(FileConfiguration, JobGroup):
                 "No Home Assistant Core data inside the backup", _LOGGER.error
             )
 
-        if backup.supervisor_version > self.sys_supervisor.version:
-            raise BackupInvalidError(
-                f"Backup was made on supervisor version {backup.supervisor_version}, "
-                f"can't restore on {self.sys_supervisor.version}. Must update supervisor first.",
-                _LOGGER.error,
-            )
+        await self._check_supervisor_version(backup)
 
         # If being run in the background, notify caller that validation has completed
         if validation_complete:
@@ -991,7 +1010,7 @@ class BackupManager(FileConfiguration, JobGroup):
 
         # Create thaw task first to ensure we eventually undo freezes even if the below fails
         self._thaw_task = asyncio.shield(
-            self.sys_create_task(self._thaw_all(running_apps, timeout))
+            self.sys_create_background_task(self._thaw_all(running_apps, timeout))
         )
 
         # Tell Home Assistant to freeze for a backup

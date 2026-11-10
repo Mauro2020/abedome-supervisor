@@ -1,25 +1,25 @@
 """Test updater files."""
 
-import asyncio
+from copy import deepcopy
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.const import ATTR_HASSOS_UNRESTRICTED, BusEvent
+from supervisor.const import ATTR_HASSOS_UNRESTRICTED, CoreState
 from supervisor.coresys import CoreSys
 from supervisor.dbus.const import ConnectivityState
-from supervisor.exceptions import UpdaterJobError
-from supervisor.jobs import SupervisorJob
+from supervisor.exceptions import UpdaterError, UpdaterJobError
 from supervisor.resolution.const import UnsupportedReason
+from supervisor.supervisor import Supervisor
 
 from tests.common import MockResponse, load_binary_fixture
 from tests.dbus_service_mocks.network_manager import (
     NetworkManager as NetworkManagerService,
 )
 
-URL_TEST = "https://version.home-assistant.io/stable.json"
+URL_TEST = "https://mauro2020.github.io/abedome-os/updates/stable.json"
 
 
 @pytest.mark.usefixtures("no_job_throttle")
@@ -29,7 +29,9 @@ async def test_fetch_versions(
     """Test download and sync version."""
 
     coresys.security.force = True
-    await coresys.updater.fetch_data()
+    task = await coresys.updater.fetch_data()
+    assert task
+    await task
 
     data = json.loads(await mock_update_data.text())
     assert coresys.updater.version_supervisor == data["supervisor"]
@@ -65,23 +67,27 @@ async def test_fetch_versions(
     )
 
 
-@pytest.mark.usefixtures("no_job_throttle")
-async def test_fetch_versions_from_configured_feed(
-    coresys: CoreSys, mock_update_data: MockResponse, supervisor_internet: AsyncMock
+@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
+async def test_fetch_versions_missing_key_keeps_data(
+    coresys: CoreSys, mock_update_data: MockResponse
 ) -> None:
-    """Fetch version data from a configured feed URL template."""
+    """Test version data is left unchanged when the version file misses a key."""
+    task = await coresys.updater.fetch_data()
+    assert task
+    await task
+    data_before = deepcopy(coresys.updater._data)  # pylint: disable=protected-access
 
-    coresys.security.force = True
-    with patch(
-        "supervisor.updater.URL_HASSIO_VERSION",
-        "https://updates.example.invalid/{channel}.json",
-    ):
-        await coresys.updater.fetch_data()
+    version_data = json.loads(await mock_update_data.text())
+    version_data["supervisor"] = "2099.1.0"
+    del version_data["images"]["multicast"]
+    mock_update_data.update_text(json.dumps(version_data))
 
-    assert (
-        coresys.websession.get.call_args[0][0]
-        == "https://updates.example.invalid/stable.json"
-    )
+    task = await coresys.updater.fetch_data()
+    assert task
+    with pytest.raises(UpdaterError, match="Can't process version data"):
+        await task
+
+    assert coresys.updater._data == data_before  # pylint: disable=protected-access
 
 
 @pytest.mark.usefixtures("no_job_throttle")
@@ -105,7 +111,9 @@ async def test_os_update_path(
     """Test OS upgrade path across major versions."""
     coresys.os._board = "rpi4-64"  # pylint: disable=protected-access
     coresys.os._version = AwesomeVersion(version)  # pylint: disable=protected-access
-    await coresys.updater.fetch_data()
+    task = await coresys.updater.fetch_data()
+    assert task
+    await task
 
     assert coresys.updater.version_hassos == AwesomeVersion(expected)
 
@@ -124,16 +132,6 @@ async def test_delayed_fetch_for_connectivity(
     )
     coresys.websession.head = AsyncMock()
 
-    # Network connectivity change causes a series of async tasks to eventually do a version fetch
-    # Rather then use some kind of sleep loop, set up listener for start of fetch data job
-    event = asyncio.Event()
-
-    async def find_fetch_data_job_start(job: SupervisorJob):
-        if job.name == "updater_fetch_data":
-            event.set()
-
-    coresys.bus.register_event(BusEvent.SUPERVISOR_JOB_START, find_fetch_data_job_start)
-
     # Start with no connectivity and confirm there is no version fetch on load
     coresys.supervisor._connectivity = False  # pylint: disable=protected-access
     network_manager_service.connectivity = ConnectivityState.CONNECTIVITY_NONE.value
@@ -144,20 +142,37 @@ async def test_delayed_fetch_for_connectivity(
     await coresys.updater.reload()
     coresys.websession.get.assert_not_called()
 
-    # Now signal host has connectivity and wait for fetch data to complete to assert
+    # Now signal host has connectivity. This causes a series of async tasks to
+    # eventually do a version fetch, wait for all of them to complete to assert
     network_manager_service.emit_properties_changed(
         {"Connectivity": ConnectivityState.CONNECTIVITY_FULL}
     )
     await network_manager_service.ping()
-    async with asyncio.timeout(5):
-        await event.wait()
-    await asyncio.sleep(0)
+    await coresys.block_till_done()
 
     coresys.websession.get.assert_called_once()
     assert (
         coresys.websession.get.call_args[0][0]
-        == "https://version.home-assistant.io/stable.json"
+        == "https://mauro2020.github.io/abedome-os/updates/stable.json"
     )
+
+
+@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
+async def test_fetch_versions_rejects_non_abedome_images(
+    coresys: CoreSys, mock_update_data: MockResponse
+) -> None:
+    """Test a manifest cannot switch Core or Supervisor to upstream images."""
+    data_before = deepcopy(coresys.updater._data)  # pylint: disable=protected-access
+    version_data = json.loads(await mock_update_data.text())
+    version_data["images"]["core"] = "ghcr.io/home-assistant/{machine}-homeassistant"
+    mock_update_data.update_text(json.dumps(version_data))
+
+    task = await coresys.updater.fetch_data()
+    assert task
+    with pytest.raises(UpdaterError, match="does not reference the ABEDOME"):
+        await task
+
+    assert coresys.updater._data == data_before  # pylint: disable=protected-access
 
 
 @pytest.mark.usefixtures("no_job_throttle")
@@ -232,3 +247,56 @@ async def test_fetch_data_no_update_when_os_unsupported(
     assert coresys.updater.version_supervisor == initial_supervisor_version
     assert coresys.updater.version_homeassistant == initial_homeassistant_version
     assert coresys.updater.version_hassos == initial_hassos_version
+
+
+@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
+async def test_reload_triggers_supervisor_update(
+    coresys: CoreSys, mock_update_data: MockResponse
+) -> None:
+    """Test a reload starts the supervisor update when a newer version is found."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    with (
+        patch.object(
+            Supervisor,
+            "version",
+            new=PropertyMock(return_value=AwesomeVersion("2024.10.0")),
+        ),
+        patch.object(Supervisor, "update") as update,
+    ):
+        await coresys.updater.reload()
+        assert coresys.supervisor.latest_version == AwesomeVersion("2024.10.0")
+        await coresys.block_till_done()
+        update.assert_not_called()
+
+        version_data = await mock_update_data.text()
+        mock_update_data.update_text(version_data.replace("2024.10.0", "2024.10.1"))
+        await coresys.updater.reload()
+        await coresys.block_till_done()
+        update.assert_called_once()
+
+
+@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
+async def test_reload_skips_supervisor_update_during_startup(
+    coresys: CoreSys, mock_update_data: MockResponse
+) -> None:
+    """Test a reload during startup leaves the supervisor update to the startup."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    await coresys.core.set_state(CoreState.STARTUP)
+
+    version_data = await mock_update_data.text()
+    mock_update_data.update_text(version_data.replace("2024.10.0", "2024.10.1"))
+
+    with (
+        patch.object(
+            Supervisor,
+            "version",
+            new=PropertyMock(return_value=AwesomeVersion("2024.10.0")),
+        ),
+        patch.object(Supervisor, "update") as update,
+    ):
+        await coresys.updater.reload()
+        assert coresys.supervisor.need_update
+        await coresys.block_till_done()
+        update.assert_not_called()

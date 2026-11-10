@@ -1,21 +1,20 @@
 {
-  "schema_version": 1,
   "product": "ABEDOME Supervisor",
-  "upstream": "home-assistant/supervisor",
-  "upstream_default_branch": "main",
-  "product_branch": "abedome/develop",
-  "strategy": "weekly-upstream-draft-pull-request",
-  "approval_required": true,
-  "auto_merge": false,
-  "runtime_update_feed": {
-    "environment_variable": "SUPERVISOR_VERSION_URL",
-    "url_template": "https://<abedome-update-host>/{channel}.json",
-    "enabled": false,
-    "activation_requires": [
-      "immutable ABEDOME version manifest",
-      "signed ABEDOME OS release artifacts",
-      "private production RAUC signing key",
-      "ABEDOME OS launcher configuration"
-    ]
+  "version": "2026.11.0",
+  "upstream": {
+    "repository": "https://github.com/home-assistant/supervisor",
+    "commit": "c1c6f0a754c0656eb1af189f11009f1cfc4b3e28",
+    "tag": "2026.11.0"
+  },
+  "runtime": {
+    "core_image": "ghcr.io/mauro2020/abedome-core",
+    "supervisor_image": "ghcr.io/mauro2020/abedome-supervisor",
+    "update_feed": "https://mauro2020.github.io/abedome-os/updates/{channel}.json"
+  },
+  "release": {
+    "supported_platform": "ABEDOME OS OVA",
+    "architectures": ["linux/amd64"],
+    "multiarch": false,
+    "feed_publication": "external gated step; never performed by the image workflow"
   }
 }

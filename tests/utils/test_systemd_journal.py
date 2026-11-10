@@ -1,7 +1,8 @@
 """Test systemd journal utilities."""
 
 import asyncio
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -11,6 +12,7 @@ from supervisor.utils.systemd_journal import (
     journal_boots_reader,
     journal_logs_reader,
     journal_plain_formatter,
+    journal_timestamp_formatter,
     journal_verbose_formatter,
 )
 
@@ -41,6 +43,84 @@ def test_format_simple_newlines():
     assert journal_plain_formatter(fields) == "Hello,\nworld!\n"
 
 
+@pytest.mark.parametrize(
+    ("timestamp", "expected_timestamp"),
+    [
+        pytest.param("1000", "1970-01-01 00:00:00.001+00:00", id="milliseconds"),
+        pytest.param(
+            "1379403171123456", "2013-09-17 07:32:51.123+00:00", id="microseconds"
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("message", "no_colors", "expected_message"),
+    [
+        pytest.param("Hello, world!", False, "Hello, world!", id="plain"),
+        pytest.param("Hello,\nworld!\n", False, "Hello,\nworld!\n", id="multiline"),
+        pytest.param(
+            "\x1b[32mHello, world!\x1b[0m",
+            False,
+            "\x1b[32mHello, world!\x1b[0m",
+            id="colors",
+        ),
+        pytest.param(
+            "\x1b[32mHello, world!\x1b[0m", True, "Hello, world!", id="no-colors"
+        ),
+        pytest.param("", False, "", id="empty"),
+    ],
+)
+def test_format_timestamp(
+    timestamp: str,
+    expected_timestamp: str,
+    message: str,
+    no_colors: bool,
+    expected_message: str,
+) -> None:
+    """Test timestamp formatting without requiring host or process metadata."""
+    fields = {"__REALTIME_TIMESTAMP": timestamp, "MESSAGE": message}
+    assert (
+        journal_timestamp_formatter(fields, no_colors=no_colors)
+        == f"{expected_timestamp} {expected_message}"
+    )
+
+
+def test_format_timestamp_timezone() -> None:
+    """Test timestamp formatter converts timestamp to the given timezone."""
+    fields = {"__REALTIME_TIMESTAMP": "1379403171000000", "MESSAGE": "Hello, world!"}
+    assert (
+        journal_timestamp_formatter(fields, tz=ZoneInfo("Europe/Prague"))
+        == "2013-09-17 09:32:51.000+02:00 Hello, world!"
+    )
+
+
+@pytest.mark.parametrize(
+    ("no_colors", "expected_message"),
+    [
+        pytest.param(False, "\x1b[31mERROR\x1b[0m", id="colors"),
+        pytest.param(True, "ERROR", id="no-colors"),
+    ],
+)
+async def test_parsing_timestamp(no_colors: bool, expected_message: str) -> None:
+    """Test timestamp formatting and cursor preservation for binary journal messages."""
+    journal_logs, stream = _journal_logs_mock()
+    stream.feed_data(
+        b"__CURSOR=cursor1\n"
+        b"__REALTIME_TIMESTAMP=1379403171000000\n"
+        b"_HOSTNAME=homeassistant\n"
+        b"SYSLOG_IDENTIFIER=python\n"
+        b"_PID=666\n"
+        b"MESSAGE\n\x0e\x00\x00\x00\x00\x00\x00\x00\x1b[31mERROR\x1b[0m\n\n"
+    )
+    stream.feed_eof()
+
+    assert [
+        entry
+        async for entry in journal_logs_reader(
+            journal_logs, log_formatter=LogFormatter.TIMESTAMP, no_colors=no_colors
+        )
+    ] == [("cursor1", f"2013-09-17 07:32:51.000+00:00 {expected_message}")]
+
+
 def test_format_verbose_timestamp():
     """Test timestamp is properly formatted."""
     fields = {
@@ -51,7 +131,7 @@ def test_format_verbose_timestamp():
         "MESSAGE": "x",
     }
     formatted = journal_verbose_formatter(fields)
-    assert formatted.startswith("1970-01-01 00:00:00.001 "), (
+    assert formatted.startswith("1970-01-01 00:00:00.001+00:00 "), (
         f"Invalid log timestamp: {formatted}"
     )
 
@@ -67,7 +147,37 @@ def test_format_verbose():
     }
     assert (
         journal_verbose_formatter(fields)
-        == "2013-09-17 07:32:51.000 homeassistant python[666]: Hello, world!"
+        == "2013-09-17 07:32:51.000+00:00 homeassistant python[666]: Hello, world!"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tz", "expected_ts"),
+    [
+        pytest.param(
+            ZoneInfo("Europe/Prague"),
+            "2013-09-17 09:32:51.000+02:00",
+            id="europe_prague",
+        ),
+        pytest.param(
+            ZoneInfo("America/New_York"),
+            "2013-09-17 03:32:51.000-04:00",
+            id="america_new_york",
+        ),
+    ],
+)
+def test_format_verbose_timezone(tz: ZoneInfo, expected_ts: str):
+    """Test verbose formatter converts timestamp to the given timezone."""
+    fields = {
+        "__REALTIME_TIMESTAMP": "1379403171000000",
+        "_HOSTNAME": "homeassistant",
+        "SYSLOG_IDENTIFIER": "python",
+        "_PID": "666",
+        "MESSAGE": "Hello, world!",
+    }
+    assert (
+        journal_verbose_formatter(fields, tz=tz)
+        == f"{expected_ts} homeassistant python[666]: Hello, world!"
     )
 
 
@@ -82,7 +192,7 @@ def test_format_verbose_newlines():
     }
     assert (
         journal_verbose_formatter(fields)
-        == "2013-09-17 07:32:51.000 homeassistant python[666]: Hello,\nworld!\n"
+        == "2013-09-17 07:32:51.000+00:00 homeassistant python[666]: Hello,\nworld!\n"
     )
 
 
@@ -98,7 +208,7 @@ def test_format_verbose_colors():
 
     assert (
         journal_verbose_formatter(fields)
-        == "2013-09-17 07:32:51.000 homeassistant python[666]: \x1b[32mHello, world!\x1b[0m"
+        == "2013-09-17 07:32:51.000+00:00 homeassistant python[666]: \x1b[32mHello, world!\x1b[0m"
     )
 
 
@@ -123,7 +233,31 @@ async def test_parsing_verbose():
     _, line = await anext(
         journal_logs_reader(journal_logs, log_formatter=LogFormatter.VERBOSE)
     )
-    assert line == "2013-09-17 07:32:51.000 homeassistant python[666]: Hello, world!"
+    assert (
+        line == "2013-09-17 07:32:51.000+00:00 homeassistant python[666]: Hello, world!"
+    )
+
+
+async def test_parsing_verbose_timezone():
+    """Test verbose formatter uses timezone passed to the reader."""
+    journal_logs, stream = _journal_logs_mock()
+    stream.feed_data(
+        b"__REALTIME_TIMESTAMP=1379403171000000\n"
+        b"_HOSTNAME=homeassistant\n"
+        b"SYSLOG_IDENTIFIER=python\n"
+        b"_PID=666\n"
+        b"MESSAGE=Hello, world!\n\n"
+    )
+    _, line = await anext(
+        journal_logs_reader(
+            journal_logs,
+            log_formatter=LogFormatter.VERBOSE,
+            tz=ZoneInfo("Europe/Prague"),
+        )
+    )
+    assert (
+        line == "2013-09-17 09:32:51.000+02:00 homeassistant python[666]: Hello, world!"
+    )
 
 
 async def test_parsing_newlines_in_message():
@@ -152,8 +286,51 @@ async def test_parsing_newlines_in_multiple_fields():
         b"AFTER=after\n\n"
     )
 
-    assert await anext(journal_logs_reader(journal_logs)) == (ANY, "Hello,\nworld!\n")
-    assert await anext(journal_logs_reader(journal_logs)) == (ANY, "Hello,\nworld!")
+    reader = journal_logs_reader(journal_logs)
+    assert await anext(reader) == (ANY, "Hello,\nworld!\n")
+    assert await anext(reader) == (ANY, "Hello,\nworld!")
+
+
+SPLIT_EXPORT = (
+    b"__CURSOR=cursor1\n"
+    b"MESSAGE\n\x0e\x00\x00\x00\x00\x00\x00\x00Hello,\nworld!\n\n"
+    b"AFTER=after\n\n"
+    b"__CURSOR=cursor2\n"
+    b"MESSAGE=Hello again, world!\n\n"
+    b"__CURSOR=cursor3\n"
+    b"MESSAGE\n\x0b\x00\x00\x00\x00\x00\x00\x00Hello,\n\nyou\n\n"
+    b"MESSAGE=No cursor\n"
+)
+
+
+async def test_parsing_truncated_binary_field() -> None:
+    """Test a stream ending inside a binary field raises the Supervisor error."""
+    journal_logs, stream = _journal_logs_mock()
+    stream.feed_data(b"MESSAGE\n\x05\x00\x00\x00\x00\x00\x00\x00Hello")
+    stream.feed_eof()
+
+    with pytest.raises(MalformedBinaryEntryError):
+        await anext(journal_logs_reader(journal_logs))
+
+
+@pytest.mark.parametrize("read_size", [1, 7, 64 * 1024])
+async def test_parsing_split_reads(read_size: int) -> None:
+    """Test entries are yielded one by one regardless of the read size.
+
+    The last binary field follows completed entries and holds the entry
+    terminator, so it exercises the parser's buffer compaction.
+    """
+    journal_logs, stream = _journal_logs_mock()
+    stream.feed_data(SPLIT_EXPORT)
+    stream.feed_eof()
+
+    with patch("supervisor.utils.systemd_journal.JOURNAL_READ_SIZE", read_size):
+        assert [entry async for entry in journal_logs_reader(journal_logs)] == [
+            ("cursor1", "Hello,\nworld!\n"),
+            ("cursor2", "Hello again, world!"),
+            ("cursor3", "Hello,\n\nyou"),
+            (None, "No cursor"),
+        ]
 
 
 async def test_parsing_two_messages():
@@ -332,7 +509,7 @@ def test_format_verbose_no_colors():
     }
     assert (
         journal_verbose_formatter(fields, no_colors=True)
-        == "2013-09-17 07:32:51.000 homeassistant python[666]: Hello, world!"
+        == "2013-09-17 07:32:51.000+00:00 homeassistant python[666]: Hello, world!"
     )
 
 
@@ -352,7 +529,7 @@ async def test_parsing_colored_logs_verbose_no_colors():
             journal_logs, log_formatter=LogFormatter.VERBOSE, no_colors=True
         )
     )
-    assert line == "2013-09-17 07:32:51.000 homeassistant python[666]: ERROR"
+    assert line == "2013-09-17 07:32:51.000+00:00 homeassistant python[666]: ERROR"
 
 
 async def test_parsing_multiple_color_codes():

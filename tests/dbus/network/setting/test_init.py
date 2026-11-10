@@ -7,9 +7,10 @@ from dbus_fast import Variant
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 
+from supervisor.dbus.const import ConnectionFlags
 from supervisor.dbus.network import NetworkManager
 from supervisor.dbus.network.interface import NetworkInterface
-from supervisor.dbus.network.setting import NetworkSetting
+from supervisor.dbus.network.setting import NetworkSetting, _merge_settings_attribute
 from supervisor.dbus.network.setting.generate import get_connection_from_interface
 from supervisor.host.configuration import Ip6Setting
 from supervisor.host.const import InterfaceMethod
@@ -125,6 +126,24 @@ async def test_ethernet_update(
     assert len(connection_settings_service.Update.calls) == 2
 
 
+def test_merge_settings_attribute_empty_dict_clears_attribute():
+    """Test an empty dict for an attribute removes it instead of no-op merging."""
+    base_settings = {"802-11-wireless-security": {"key-mgmt": Variant("s", "wpa-psk")}}
+    _merge_settings_attribute(
+        base_settings, {"802-11-wireless-security": {}}, "802-11-wireless-security"
+    )
+    assert "802-11-wireless-security" not in base_settings
+
+
+def test_merge_settings_attribute_absent_leaves_base_untouched():
+    """Test omitting an attribute from new_settings leaves the base as-is."""
+    base_settings = {"802-11-wireless-security": {"key-mgmt": Variant("s", "wpa-psk")}}
+    _merge_settings_attribute(base_settings, {}, "802-11-wireless-security")
+    assert base_settings["802-11-wireless-security"] == {
+        "key-mgmt": Variant("s", "wpa-psk")
+    }
+
+
 async def test_ipv6_disabled_is_link_local(
     dbus_interface: NetworkInterface, network_manager: NetworkManager
 ):
@@ -184,3 +203,104 @@ async def test_watching_updated_signal(
     await connection_settings_service.ping()
     await connection_settings_service.ping()
     assert connection_settings_service.GetSettings.calls == [(), ()]
+
+
+@pytest.mark.parametrize(
+    ("section", "attribute", "data"),
+    [
+        pytest.param(
+            "connection",
+            "connection",
+            {"id": Variant("s", "Test"), "type": Variant("s", "802-3-ethernet")},
+            id="connection",
+        ),
+        pytest.param(
+            "802-11-wireless-security",
+            "wireless_security",
+            {"key-mgmt": Variant("s", "wpa-psk")},
+            id="wireless_security",
+        ),
+        pytest.param(
+            "802-11-wireless",
+            "wireless",
+            {"ssid": Variant("ay", b"TestSSID")},
+            id="wireless",
+        ),
+        pytest.param(
+            "802-3-ethernet",
+            "ethernet",
+            {"assigned-mac-address": Variant("s", "preserve")},
+            id="ethernet",
+        ),
+        pytest.param(
+            "vlan",
+            "vlan",
+            {"id": Variant("u", 10), "parent": Variant("s", "eth0")},
+            id="vlan",
+        ),
+        pytest.param("ipv4", "ipv4", {"method": Variant("s", "auto")}, id="ipv4"),
+        pytest.param("ipv6", "ipv6", {"method": Variant("s", "auto")}, id="ipv6"),
+        pytest.param(
+            "match",
+            "match",
+            {"path": Variant("as", ["platform-ff3f0000.ethernet"])},
+            id="match",
+        ),
+    ],
+)
+async def test_reload_clears_removed_section(
+    connection_settings_service: ConnectionSettingsService,
+    dbus_session_bus: MessageBus,
+    section: str,
+    attribute: str,
+    data: dict[str, Variant],
+):
+    """Test reload clears a section NetworkManager no longer reports."""
+    connection_settings_service.settings[section] = data
+    settings = NetworkSetting("/org/freedesktop/NetworkManager/Settings/1")
+    await settings.connect(dbus_session_bus)
+    assert getattr(settings, attribute) is not None
+
+    del connection_settings_service.settings[section]
+    await settings.reload()
+    assert getattr(settings, attribute) is None
+
+
+async def test_non_utf8_wireless_ssid(
+    connection_settings_service: ConnectionSettingsService, dbus_session_bus: MessageBus
+):
+    """Test a wireless profile whose SSID is not valid UTF-8 is kept as bytes."""
+    connection_settings_service.settings["802-11-wireless"] = {
+        "ssid": Variant("ay", b"Z\xfcrich")
+    }
+    settings = NetworkSetting("/org/freedesktop/NetworkManager/Settings/1")
+    await settings.connect(dbus_session_bus)
+
+    assert settings.wireless.ssid == b"Z\xfcrich"
+
+
+@pytest.mark.parametrize(
+    ("flags", "is_generated"),
+    [
+        pytest.param(0, False, id="stored"),
+        pytest.param(ConnectionFlags.UNSAVED, False, id="unsaved"),
+        pytest.param(
+            ConnectionFlags.UNSAVED | ConnectionFlags.NM_GENERATED,
+            True,
+            id="auto_default",
+        ),
+        pytest.param(ConnectionFlags.VOLATILE, True, id="volatile"),
+    ],
+)
+async def test_flags(
+    dbus_interface: NetworkInterface,
+    connection_settings_service: ConnectionSettingsService,
+    flags: int,
+    is_generated: bool,
+):
+    """Test connection profile flags are read from NetworkManager."""
+    connection_settings_service.flags = flags
+    await dbus_interface.settings.reload()
+
+    assert dbus_interface.settings.flags == ConnectionFlags(flags)
+    assert dbus_interface.settings.is_generated is is_generated

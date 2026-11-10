@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
 import re
-from typing import Final
+from typing import Any, Final
 
 import aiohttp
 from aiohttp import WSCloseCode, WSMessageTypeError, web
@@ -14,10 +14,14 @@ from aiohttp.hdrs import AUTHORIZATION, CONTENT_TYPE
 from aiohttp.http_websocket import WSMsgType
 from aiohttp.web_exceptions import HTTPBadGateway, HTTPForbidden, HTTPUnauthorized
 
+from ..const import STOPPING_STATES
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError, HomeAssistantAPIError, HomeAssistantAuthError
-from ..utils.json import json_dumps
+from ..utils.json import json_dumps, json_loads
 from ..utils.logging import AppLoggerAdapter
+from .const import WEBSOCKETS
+from .middleware.security import recursive_unquote
+from .utils import stop_on_disconnect
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -36,6 +40,36 @@ HEADER_HA_ACCESS = "X-Ha-Access"
 # The security middleware blacklist already blocks them; this is a redundant
 # guard so the proxy can't become a confused deputy if that ever regresses.
 CORE_API_DENY: Final = re.compile(r"^hassio(?:/|_)")
+# Command types that only Home Assistant's own frontend may use, reserved for the
+# `hassio` integration in Core. Apps proxying to the Home Assistant WebSocket API
+# only ever need normal HA commands (e.g. call_service, subscribe_events) and must
+# never be able to reach these, since Core executes them by calling back into the
+# Supervisor with its own, fully privileged token.
+DENIED_WS_TYPE_PREFIXES = ("supervisor/", "hassio/")
+
+
+def _command_type(command: Any) -> str | None:
+    """Return the type of a command, or None if it isn't a well-formed command."""
+    if isinstance(command, dict) and isinstance(
+        command_type := command.get("type"), str
+    ):
+        return command_type
+    return None
+
+
+def _denied_command_types(parsed: Any) -> list[str | None]:
+    """Return the types of commands apps must not send, None for malformed ones.
+
+    An empty list means the frame may be forwarded.
+    """
+    # Core dispatches each element of a JSON array as a separate command
+    commands = parsed if isinstance(parsed, list) else [parsed]
+    return [
+        command_type
+        for command in commands
+        if (command_type := _command_type(command)) is None
+        or command_type.startswith(DENIED_WS_TYPE_PREFIXES)
+    ]
 
 
 class APIProxy(CoreSysAttributes):
@@ -63,13 +97,14 @@ class APIProxy(CoreSysAttributes):
 
         response.headers["X-Accel-Buffering"] = "no"
 
-        try:
-            await response.prepare(request)
-            async for data in client.content:
-                await response.write(data)
-        except aiohttp.ClientError, aiohttp.ClientPayloadError:
-            # Client disconnected or upstream closed
-            pass
+        async with stop_on_disconnect(request):
+            try:
+                await response.prepare(request)
+                async for data in client.content:
+                    await response.write(data)
+            except aiohttp.ClientError, aiohttp.ClientPayloadError:
+                # Client disconnected or upstream closed
+                pass
 
         return response
 
@@ -146,8 +181,13 @@ class APIProxy(CoreSysAttributes):
         """Proxy Home Assistant API Requests."""
         self._check_access(request)
 
-        path = request.match_info.get("path", "")
-        if CORE_API_DENY.match(path):
+        # Forward the path exactly as the app sent it on the wire. The route's
+        # match_info is percent-decoded once already, and re-encoding a decoded
+        # path is lossy (e.g. %2F becomes a path separator, and a second decode
+        # downstream turns hassio%5Fauth into hassio_auth). Both routes end in
+        # "/api/" right before the captured path.
+        path = request.url.raw_path.partition("/api/")[2]
+        if CORE_API_DENY.match(recursive_unquote(path)):
             _LOGGER.warning("Blocked proxied add-on access to Core API path %s", path)
             raise HTTPForbidden
 
@@ -192,29 +232,80 @@ class APIProxy(CoreSysAttributes):
                 _LOGGER.error,
             ) from err
 
+    async def _proxy_app_text(
+        self,
+        data: str,
+        source: web.WebSocketResponse | ClientWebSocketResponse,
+        target: web.WebSocketResponse | ClientWebSocketResponse,
+        logger: AppLoggerAdapter,
+    ) -> None:
+        """Forward a TEXT message from an app to Core unless it must be rejected.
+
+        Commands whose type is reserved for Home Assistant's own frontend (see
+        DENIED_WS_TYPE_PREFIXES) are rejected to prevent apps from using this proxy
+        to reach the Supervisor API at full privilege through Home Assistant Core.
+        Anything that can't be verified as allowed is rejected as well.
+        """
+        try:
+            parsed = json_loads(data)
+        except ValueError:
+            # Core closes the connection on invalid JSON too
+            logger.warning("Received invalid JSON from app, closing connection")
+            await target.close()
+            await source.close()
+            return
+
+        if not (denied_types := _denied_command_types(parsed)):
+            await target.send_str(data)
+            return
+
+        logger.warning(
+            "Blocked WebSocket message with disallowed or malformed command types: %r",
+            denied_types,
+        )
+        # Batches and other non-dict frames get a single result without an id
+        await source.send_json(
+            {
+                "id": parsed.get("id") if isinstance(parsed, dict) else None,
+                "type": "result",
+                "success": False,
+                "error": {"code": "unauthorized", "message": "Unauthorized"},
+            },
+            dumps=json_dumps,
+        )
+
     async def _proxy_message(
         self,
         source: web.WebSocketResponse | ClientWebSocketResponse,
         target: web.WebSocketResponse | ClientWebSocketResponse,
         logger: AppLoggerAdapter,
+        *,
+        filter_app_commands: bool = False,
     ) -> None:
-        """Proxy a message from client to server or vice versa."""
+        """Proxy a message from client to server or vice versa.
+
+        If filter_app_commands is set, TEXT messages are passed through
+        _proxy_app_text to keep apps from reaching commands reserved for Home
+        Assistant's own frontend.
+        """
         while not source.closed and not target.closed:
             msg = await source.receive()
             match msg.type:
+                case WSMsgType.TEXT if filter_app_commands:
+                    await self._proxy_app_text(msg.data, source, target, logger)
                 case WSMsgType.TEXT:
                     await target.send_str(msg.data)
                 case WSMsgType.BINARY:
                     await target.send_bytes(msg.data)
-                case WSMsgType.CLOSE | WSMsgType.CLOSED:
+                # CLOSING is received when the source is closed locally from another
+                # task (e.g. on API stop), the other leg must be closed as well then
+                case WSMsgType.CLOSE | WSMsgType.CLOSING | WSMsgType.CLOSED:
                     logger.debug(
                         "Received WebSocket message type %r from %s.",
                         msg.type,
                         "app" if type(source) is web.WebSocketResponse else "Core",
                     )
                     await target.close()
-                case WSMsgType.CLOSING:
-                    pass
                 case WSMsgType.ERROR:
                     logger.warning(
                         "Error WebSocket message received while proxying: %r", msg.data
@@ -244,6 +335,11 @@ class APIProxy(CoreSysAttributes):
         # init server
         server = web.WebSocketResponse(heartbeat=30)
         await server.prepare(request)
+        request.config_dict[WEBSOCKETS].add(server)
+        # The upgrade may complete after API stop closed the tracked websockets
+        if self.sys_core.state in STOPPING_STATES:
+            await server.close(code=WSCloseCode.GOING_AWAY)
+            return server
         app_name = None
 
         # handle authentication
@@ -279,6 +375,9 @@ class APIProxy(CoreSysAttributes):
             _LOGGER.error("Timeout during authentication for WebSocket API")
             return server
         except WSMessageTypeError as err:
+            # Closed on API stop while waiting for the auth message
+            if self.sys_core.state in STOPPING_STATES:
+                return server
             _LOGGER.error(
                 "Unexpected message during authentication for WebSocket API: %s", err
             )
@@ -296,8 +395,12 @@ class APIProxy(CoreSysAttributes):
         logger = AppLoggerAdapter(_LOGGER, {"app_name": app_name})
         logger.info("Home Assistant WebSocket API proxy running")
 
-        client_task = self.sys_create_task(self._proxy_message(client, server, logger))
-        server_task = self.sys_create_task(self._proxy_message(server, client, logger))
+        client_task = self.sys_create_background_task(
+            self._proxy_message(client, server, logger)
+        )
+        server_task = self.sys_create_background_task(
+            self._proxy_message(server, client, logger, filter_app_commands=True)
+        )
 
         # Typically, this will return with an empty pending set. However, if one of
         # the directions has an exception, make sure to close both connections and

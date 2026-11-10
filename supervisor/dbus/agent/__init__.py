@@ -25,6 +25,7 @@ from .cgroup import CGroup
 from .datadisk import DataDisk
 from .swap import Swap
 from .system import System
+from .timesyncd import Timesyncd
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class OSAgent(DBusInterfaceProxy):
         self._datadisk: DataDisk = DataDisk()
         self._swap: Swap = Swap()
         self._system: System = System()
+        self._timesyncd: Timesyncd = Timesyncd()
 
     @property
     def cgroup(self) -> CGroup:
@@ -79,6 +81,11 @@ class OSAgent(DBusInterfaceProxy):
         return self._board
 
     @property
+    def timesyncd(self) -> Timesyncd:
+        """Return Timesyncd DBUS object."""
+        return self._timesyncd
+
+    @property
     @dbus_property
     def version(self) -> AwesomeVersion:
         """Return version of OS-Agent."""
@@ -88,7 +95,7 @@ class OSAgent(DBusInterfaceProxy):
     @dbus_property
     def diagnostics(self) -> bool:
         """Return if diagnostics is enabled on OS-Agent."""
-        return self.properties[DBUS_ATTR_DIAGNOSTICS]
+        return apply_upstream_diagnostics_policy(self.properties[DBUS_ATTR_DIAGNOSTICS])
 
     @dbus_connected
     def set_diagnostics(self, value: bool) -> Awaitable[None]:
@@ -105,6 +112,7 @@ class OSAgent(DBusInterfaceProxy):
             self.datadisk,
             self.swap,
             self.system,
+            self.timesyncd,
         ]
 
     async def connect(self, bus: MessageBus) -> None:
@@ -137,9 +145,10 @@ class OSAgent(DBusInterfaceProxy):
         """Update Properties."""
         await super().update(changed)
 
+        diagnostics = self.properties[DBUS_ATTR_DIAGNOSTICS]
         if (
-            self.diagnostics is True
-            and apply_upstream_diagnostics_policy(self.diagnostics) is False
+            diagnostics is True
+            and apply_upstream_diagnostics_policy(diagnostics) is False
         ):
             await self.set_diagnostics(False)
             self.properties[DBUS_ATTR_DIAGNOSTICS] = False
@@ -148,7 +157,12 @@ class OSAgent(DBusInterfaceProxy):
             await asyncio.gather(
                 *[
                     dbus.update()
-                    for dbus in [self.apparmor, self.board, self.datadisk]
+                    for dbus in [
+                        self.apparmor,
+                        self.board,
+                        self.datadisk,
+                        self.timesyncd,
+                    ]
                     if dbus.is_connected
                 ]
             )

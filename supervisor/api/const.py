@@ -1,6 +1,9 @@
 """Const for API."""
 
 from enum import StrEnum
+import weakref
+
+from aiohttp import web
 
 CONTENT_TYPE_BINARY = "application/octet-stream"
 CONTENT_TYPE_JSON = "application/json"
@@ -11,6 +14,13 @@ CONTENT_TYPE_URL = "application/x-www-form-urlencoded"
 CONTENT_TYPE_X_LOG = "text/x-log"
 
 COOKIE_INGRESS = "ingress_session"
+
+# User-Agent product name sent by aiohasupervisor, the Python client library
+CLIENT_LIBRARY_USER_AGENT = "AioHASupervisor"
+
+# Open proxied websockets, closed on API stop as they outlive aiohttp's
+# graceful shutdown timeout otherwise
+WEBSOCKETS = web.AppKey[weakref.WeakSet[web.WebSocketResponse]]("websockets")
 
 ATTR_ADDITIONAL_LOCATIONS = "additional_locations"
 ATTR_AGENT_VERSION = "agent_version"
@@ -37,13 +47,16 @@ ATTR_DT_SYNCHRONIZED = "dt_synchronized"
 ATTR_DT_UTC = "dt_utc"
 ATTR_EJECTABLE = "ejectable"
 ATTR_FALLBACK = "fallback"
+ATTR_FALLBACK_SERVERS = "fallback_servers"
 ATTR_FILESYSTEMS = "filesystems"
 ATTR_FORCE = "force"
-ATTR_GROUP_IDS = "group_ids"
 ATTR_IDENTIFIERS = "identifiers"
 ATTR_IS_ACTIVE = "is_active"
 ATTR_IS_OWNER = "is_owner"
 ATTR_JOBS = "jobs"
+ATTR_KEY = "key"
+ATTR_KEYS = "keys"
+ATTR_LABEL = "label"
 ATTR_LLMNR = "llmnr"
 ATTR_LLMNR_HOSTNAME = "llmnr_hostname"
 ATTR_LOCAL_ONLY = "local_only"
@@ -52,9 +65,11 @@ ATTR_LOCATIONS = "locations"
 ATTR_MAX_DEPTH = "max_depth"
 ATTR_MDNS = "mdns"
 ATTR_MODEL = "model"
+ATTR_MOUNTABLE = "mountable"
 ATTR_MOUNTS = "mounts"
 ATTR_MOUNT_POINTS = "mount_points"
 ATTR_PANEL_PATH = "panel_path"
+ATTR_PARTITIONS = "partitions"
 ATTR_REMOVABLE = "removable"
 ATTR_REMOVE_CONFIG = "remove_config"
 ATTR_REVISION = "revision"

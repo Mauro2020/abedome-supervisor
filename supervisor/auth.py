@@ -1,12 +1,20 @@
 """Manage SSO for Apps with Home Assistant user."""
 
 import asyncio
+from contextlib import suppress
+from dataclasses import dataclass
 import hashlib
 import logging
 from typing import Any, TypedDict, cast
 
 from .apps.app import App
-from .const import ATTR_PASSWORD, ATTR_USERNAME, FILE_HASSIO_AUTH, HomeAssistantUser
+from .const import (
+    ATTR_GROUP_IDS,
+    ATTR_PASSWORD,
+    ATTR_USERNAME,
+    FILE_HASSIO_AUTH,
+    HomeAssistantUser,
+)
 from .coresys import CoreSys, CoreSysAttributes
 from .exceptions import (
     AuthHomeAssistantAPIValidationError,
@@ -14,12 +22,21 @@ from .exceptions import (
     AuthListUsersError,
     AuthPasswordResetError,
     HomeAssistantAPIError,
+    HomeAssistantAuthError,
     HomeAssistantWSError,
 )
 from .utils.common import FileConfiguration
+from .utils.json import json_loads
 from .validate import SCHEMA_AUTH_CONFIG
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class LoginResult:
+    """Outcome of a successful login."""
+
+    group_ids: list[str]
 
 
 class BackendAuthRequest(TypedDict):
@@ -43,30 +60,43 @@ class Auth(FileConfiguration, CoreSysAttributes):
 
         self._running: dict[str, asyncio.Task] = {}
 
-    def _check_cache(self, username: str, password: str) -> bool | None:
-        """Check password in cache."""
+    def _cache_entry(self, username_h: str) -> tuple[str, list[str]] | None:
+        """Return the cached password hash and group IDs of a user."""
+        entry = self._data.get(username_h)
+        if entry is None:
+            return None
+        if isinstance(entry, str):
+            return entry, []
+        return entry[ATTR_PASSWORD], list(entry[ATTR_GROUP_IDS])
+
+    def _check_cache(self, username: str, password: str) -> LoginResult | None:
+        """Return the cached login if the password matches the cache."""
         username_h = self._rehash(username)
         password_h = self._rehash(password, username)
 
-        if username_h not in self._data:
+        if (entry := self._cache_entry(username_h)) is None:
             _LOGGER.debug("Username '%s' not is in cache", username)
             return None
 
-        # check cache
-        if self._data.get(username_h) == password_h:
+        if entry[0] == password_h:
             _LOGGER.debug("Username '%s' is in cache", username)
-            return True
-        return False
+            return LoginResult(group_ids=entry[1])
+        return None
 
-    async def _update_cache(self, username: str, password: str) -> None:
-        """Cache a username, password."""
+    async def _update_cache(
+        self, username: str, password: str, group_ids: list[str]
+    ) -> None:
+        """Cache a username, password and group IDs."""
         username_h = self._rehash(username)
         password_h = self._rehash(password, username)
 
-        if self._data.get(username_h) == password_h:
+        if self._cache_entry(username_h) == (password_h, group_ids):
             return
 
-        self._data[username_h] = password_h
+        self._data[username_h] = {
+            ATTR_PASSWORD: password_h,
+            ATTR_GROUP_IDS: group_ids,
+        }
         await self.save_data()
 
     async def _dismatch_cache(self, username: str, password: str) -> None:
@@ -74,7 +104,7 @@ class Auth(FileConfiguration, CoreSysAttributes):
         username_h = self._rehash(username)
         password_h = self._rehash(password, username)
 
-        if self._data.get(username_h) != password_h:
+        if (entry := self._cache_entry(username_h)) is None or entry[0] != password_h:
             return
 
         self._data.pop(username_h, None)
@@ -82,36 +112,52 @@ class Auth(FileConfiguration, CoreSysAttributes):
 
     async def check_login(
         self, app: App, username: str | None, password: str | None
-    ) -> bool:
-        """Check username login."""
+    ) -> LoginResult | None:
+        """Check username login, return None if the login is invalid."""
         if username is None or password is None:
             raise AuthInvalidNonStringValueError(_LOGGER.error)
 
         _LOGGER.info("Auth request from '%s' for '%s'", app.slug, username)
 
-        # Get from cache
-        cache_hit = self._check_cache(username, password)
+        # Read the entry once so the groups belong to the password just checked
+        cached_login = self._check_cache(username, password)
 
         # Check API state
         if not await self.sys_homeassistant.api.check_api_state():
             _LOGGER.info("Home Assistant not running, checking cache")
-            return cache_hit is True
+            return cached_login
 
-        # No cache hit
-        if cache_hit is None:
+        # A mismatch may be a changed password, so only trust positive hits
+        if cached_login is None:
             return await self._backend_login(app, username, password)
 
         # Home Assistant Core take over 1-2sec to validate it
         # Let's use the cache and update the cache in background
         if username not in self._running:
-            self._running[username] = self.sys_create_task(
-                self._backend_login(app, username, password)
+            task = self.sys_create_task(
+                self._refresh_cached_login(app, username, password)
             )
+            # Cleanup must also run if the task is cancelled before it starts
+            task.add_done_callback(lambda _: self._running.pop(username, None))
+            self._running[username] = task
 
-        return cache_hit
+        return cached_login
 
-    async def _backend_login(self, app: App, username: str, password: str) -> bool:
-        """Check username login on core."""
+    async def _refresh_cached_login(
+        self, app: App, username: str, password: str
+    ) -> None:
+        """Re-validate a cached login against Core in the background.
+
+        Nothing awaits this task, so failures already logged by the request
+        path are consumed here instead of surfacing as unretrieved task errors.
+        """
+        with suppress(AuthHomeAssistantAPIValidationError, HomeAssistantAuthError):
+            await self._backend_login(app, username, password)
+
+    async def _backend_login(
+        self, app: App, username: str, password: str
+    ) -> LoginResult | None:
+        """Check username login on core, return None if the login is invalid."""
         try:
             async with self.sys_homeassistant.api.make_request(
                 "post",
@@ -125,16 +171,19 @@ class Auth(FileConfiguration, CoreSysAttributes):
             ) as req:
                 if req.status == 200:
                     _LOGGER.info("Successful login for '%s'", username)
-                    await self._update_cache(username, password)
-                    return True
+                    group_ids = _group_ids_from_body(await req.read())
+                    await self._update_cache(username, password, group_ids)
+                    return LoginResult(group_ids=group_ids)
 
                 _LOGGER.warning("Unauthorized login for '%s'", username)
                 await self._dismatch_cache(username, password)
-                return False
+                return None
+        except HomeAssistantAuthError:
+            # Core rejected Supervisor, not the app's user. The credentials
+            # were never checked, so leave the cache alone.
+            raise
         except HomeAssistantAPIError as err:
             _LOGGER.error("Can't request auth on Home Assistant: %s", err)
-        finally:
-            self._running.pop(username, None)
 
         raise AuthHomeAssistantAPIValidationError
 
@@ -151,6 +200,8 @@ class Auth(FileConfiguration, CoreSysAttributes):
                     return
 
                 _LOGGER.warning("The user '%s' is not registered", username)
+        except HomeAssistantAuthError:
+            raise
         except HomeAssistantAPIError as err:
             _LOGGER.error("Can't request password reset on Home Assistant: %s", err)
 
@@ -170,3 +221,19 @@ class Auth(FileConfiguration, CoreSysAttributes):
         for idx in range(1, 20):
             value = hashlib.sha256(f"{value}{idx}{salt2}".encode()).hexdigest()
         return value
+
+
+def _group_ids_from_body(body: bytes) -> list[str]:
+    """Return the group IDs Core reported for a login.
+
+    Core versions predating the field answer with an empty body.
+    """
+    if not body:
+        return []
+    data = json_loads(body)
+    if not isinstance(data, dict):
+        return []
+    group_ids = data.get(ATTR_GROUP_IDS)
+    if not isinstance(group_ids, list):
+        return []
+    return [group_id for group_id in group_ids if isinstance(group_id, str)]

@@ -35,13 +35,16 @@ EXIT_CODE_SIGTERM_DEFAULT = 128 + signal.SIGTERM
 class Capabilities(StrEnum):
     """Linux Capabilities."""
 
+    AUDIT_WRITE = "AUDIT_WRITE"
     BPF = "BPF"
     CHECKPOINT_RESTORE = "CHECKPOINT_RESTORE"
     DAC_READ_SEARCH = "DAC_READ_SEARCH"
     IPC_LOCK = "IPC_LOCK"
+    MKNOD = "MKNOD"
     NET_ADMIN = "NET_ADMIN"
     NET_RAW = "NET_RAW"
     PERFMON = "PERFMON"
+    SETFCAP = "SETFCAP"
     SYS_ADMIN = "SYS_ADMIN"
     SYS_MODULE = "SYS_MODULE"
     SYS_NICE = "SYS_NICE"
@@ -51,12 +54,22 @@ class Capabilities(StrEnum):
     SYS_TIME = "SYS_TIME"
 
 
+# Docker default capabilities that containerd's "reduced" profile also drops,
+# besides NET_RAW: https://github.com/containerd/containerd/pull/12588
+REDUCED_CAPABILITIES_DROP = (
+    Capabilities.AUDIT_WRITE,
+    Capabilities.MKNOD,
+    Capabilities.SETFCAP,
+)
+
+
 class ContainerState(StrEnum):
     """State of supervisor managed docker container."""
 
     FAILED = "failed"
     HEALTHY = "healthy"
     RUNNING = "running"
+    STARTING = "starting"
     STOPPED = "stopped"
     UNHEALTHY = "unhealthy"
     UNKNOWN = "unknown"
@@ -149,6 +162,7 @@ class Ulimit:
 
 
 ENV_CORE_API_SOCKET = "SUPERVISOR_CORE_API_SOCKET"
+ENV_SUPERVISOR_SOCKET = "SUPERVISOR_SOCKET"
 ENV_DUPLICATE_LOG_FILE = "HA_DUPLICATE_LOG_FILE"
 ENV_TIME = "TZ"
 ENV_TOKEN = "SUPERVISOR_TOKEN"
@@ -178,12 +192,6 @@ MOUNT_MACHINE_ID = DockerMount(
     target=MACHINE_ID.as_posix(),
     read_only=True,
 )
-MOUNT_CORE_RUN = DockerMount(
-    type=MountType.BIND,
-    source="/run/supervisor",
-    target="/run/supervisor",
-    read_only=False,
-)
 MOUNT_UDEV = DockerMount(
     type=MountType.BIND, source="/run/udev", target="/run/udev", read_only=True
 )
@@ -198,6 +206,8 @@ PATH_SSL = PurePath("/ssl")
 PATH_BACKUP = PurePath("/backup")
 PATH_SHARE = PurePath("/share")
 PATH_MEDIA = PurePath("/media")
+PATH_RUN_API = PurePath("/run/supervisor/api")
+PATH_RUN_CORE = PurePath("/run/supervisor/core")
 # Legacy, deprecated as of 2026.07
 PATH_ALL_ADDON_CONFIGS = PurePath("/addon_configs")
 PATH_LOCAL_ADDONS = PurePath("/addons")

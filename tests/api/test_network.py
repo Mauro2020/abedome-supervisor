@@ -1,5 +1,6 @@
 """Test network API."""
 
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from aiohttp.test_utils import TestClient
@@ -8,6 +9,8 @@ import pytest
 
 from supervisor.const import DOCKER_IPV4_NETWORK_MASK, DOCKER_NETWORK
 from supervisor.coresys import CoreSys
+from supervisor.host.configuration import WifiConfig
+from supervisor.host.const import AuthMethod, WifiMode
 
 from tests.const import (
     TEST_INTERFACE_ETH_MAC,
@@ -24,12 +27,9 @@ from tests.dbus_service_mocks.network_manager import (
 from tests.dbus_service_mocks.network_settings import Settings as SettingsService
 
 
-async def test_api_network_info(
-    api_client_with_prefix: tuple[TestClient, str], coresys: CoreSys
-):
+async def test_api_network_info(api_client: TestClient, coresys: CoreSys):
     """Test network manager api."""
-    api_client, prefix = api_client_with_prefix
-    resp = await api_client.get(f"{prefix}/network/info")
+    resp = await api_client.get("/network/info")
     result = await resp.json()
     assert TEST_INTERFACE_ETH_NAME in (
         inet["interface"] for inet in result["data"]["interfaces"]
@@ -74,12 +74,9 @@ async def test_api_network_info(
 @pytest.mark.parametrize(
     "interface_id", ["default", TEST_INTERFACE_ETH_NAME, TEST_INTERFACE_ETH_MAC]
 )
-async def test_api_network_interface_info(
-    api_client_with_prefix: tuple[TestClient, str], interface_id: str
-):
+async def test_api_network_interface_info(api_client: TestClient, interface_id: str):
     """Test network manager api."""
-    api_client, prefix = api_client_with_prefix
-    resp = await api_client.get(f"{prefix}/network/interface/{interface_id}/info")
+    resp = await api_client.get(f"/network/interface/{interface_id}/info")
     result = await resp.json()
     assert result["data"]["ipv4"]["address"][-1] == "192.168.2.148/24"
     assert result["data"]["ipv4"]["gateway"] == "192.168.2.1"
@@ -104,20 +101,19 @@ async def test_api_network_interface_info(
     "interface_id", [TEST_INTERFACE_ETH_NAME, TEST_INTERFACE_ETH_MAC]
 )
 async def test_api_network_interface_update_mac_or_name(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
     coresys: CoreSys,
     network_manager_service: NetworkManagerService,
     connection_settings_service: ConnectionSettingsService,
     interface_id: str,
 ):
     """Test network manager API update with name or MAC address."""
-    api_client, prefix = api_client_with_prefix
     network_manager_service.CheckConnectivity.calls.clear()
     connection_settings_service.Update.calls.clear()
     assert coresys.dbus.network.get(interface_id).settings.ipv4.method == "auto"
 
     resp = await api_client.post(
-        f"{prefix}/network/interface/{interface_id}/update",
+        f"/network/interface/{interface_id}/update",
         json={
             "ipv4": {
                 "method": "static",
@@ -140,19 +136,18 @@ async def test_api_network_interface_update_mac_or_name(
 
 
 async def test_api_network_interface_update_ethernet(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
     coresys: CoreSys,
     network_manager_service: NetworkManagerService,
     connection_settings_service: ConnectionSettingsService,
 ):
     """Test network manager API update with name or MAC address."""
-    api_client, prefix = api_client_with_prefix
     network_manager_service.CheckConnectivity.calls.clear()
     connection_settings_service.Update.calls.clear()
 
     # Full static configuration (represents frontend static config)
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={
             "ipv4": {
                 "method": "static",
@@ -179,7 +174,7 @@ async def test_api_network_interface_update_ethernet(
 
     # Partial static configuration, clears other settings (e.g. by CLI)
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={
             "ipv4": {
                 "method": "static",
@@ -203,7 +198,7 @@ async def test_api_network_interface_update_ethernet(
 
     # Auto configuration, clears all settings (represents frontend auto config)
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={
             "ipv4": {
                 "method": "auto",
@@ -227,7 +222,7 @@ async def test_api_network_interface_update_ethernet(
 
     # Update route metric
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={
             "ipv4": {
                 "route_metric": 100,
@@ -245,12 +240,11 @@ async def test_api_network_interface_update_ethernet(
 
 
 async def test_api_network_interface_update_wifi(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
 ):
     """Test network interface WiFi API."""
-    api_client, prefix = api_client_with_prefix
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_WLAN_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_WLAN_NAME}/update",
         json={
             "enabled": True,
             "ipv4": {
@@ -267,14 +261,13 @@ async def test_api_network_interface_update_wifi(
 
 
 async def test_api_network_interface_update_wifi_error(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
 ):
     """Test network interface WiFi API error handling."""
-    api_client, prefix = api_client_with_prefix
     # Simulate frontend WiFi interface edit where the user did not select
     # a WiFi SSID.
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_WLAN_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_WLAN_NAME}/update",
         json={
             "enabled": True,
             "ipv4": {
@@ -289,23 +282,23 @@ async def test_api_network_interface_update_wifi_error(
     assert result["result"] == "error"
     assert (
         result["message"]
-        == "Can't create config and activate wlan0: A 'wireless' setting with a valid SSID is required if no AP path was given."
+        == "Can't create config and activate wlan0. Check Supervisor logs for details"
     )
+    assert result["error_key"] == "host_network_create_config_error"
 
 
 async def test_api_network_interface_update_mdns(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
     coresys: CoreSys,
     network_manager_service: NetworkManagerService,
     connection_settings_service: ConnectionSettingsService,
 ):
     """Test network manager API update with mDNS/LLMNR mode."""
-    api_client, prefix = api_client_with_prefix
     network_manager_service.CheckConnectivity.calls.clear()
     connection_settings_service.Update.calls.clear()
 
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={
             "mdns": "resolve",
             "llmnr": "off",
@@ -322,12 +315,11 @@ async def test_api_network_interface_update_mdns(
 
 
 async def test_api_network_interface_update_remove(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
 ):
     """Test network manager api."""
-    api_client, prefix = api_client_with_prefix
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={"enabled": False},
     )
     result = await resp.json()
@@ -335,11 +327,10 @@ async def test_api_network_interface_update_remove(
 
 
 async def test_api_network_interface_info_invalid(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
 ):
     """Test network manager api."""
-    api_client, prefix = api_client_with_prefix
-    resp = await api_client.get(f"{prefix}/network/interface/invalid/info")
+    resp = await api_client.get("/network/interface/invalid/info")
     result = await resp.json()
 
     assert result["message"]
@@ -347,22 +338,21 @@ async def test_api_network_interface_info_invalid(
 
 
 async def test_api_network_interface_update_invalid(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
 ):
     """Test network manager api."""
-    api_client, prefix = api_client_with_prefix
-    resp = await api_client.post(f"{prefix}/network/interface/invalid/update", json={})
+    resp = await api_client.post("/network/interface/invalid/update", json={})
     result = await resp.json()
     assert result["message"] == "Interface invalid does not exist"
 
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update", json={}
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update", json={}
     )
     result = await resp.json()
     assert result["message"] == "You need to supply at least one option to update"
 
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={"ipv4": {"nameservers": "1.1.1.1"}},
     )
     result = await resp.json()
@@ -372,7 +362,7 @@ async def test_api_network_interface_update_invalid(
     )
 
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={"ipv4": {"gateway": "invalid"}},
     )
     result = await resp.json()
@@ -382,7 +372,7 @@ async def test_api_network_interface_update_invalid(
     )
 
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/update",
         json={"ipv6": {"gateway": "invalid"}},
     )
     result = await resp.json()
@@ -393,13 +383,12 @@ async def test_api_network_interface_update_invalid(
 
 
 async def test_api_network_wireless_scan(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
 ):
     """Test network manager api."""
-    api_client, prefix = api_client_with_prefix
     with patch("asyncio.sleep", return_value=AsyncMock()):
         resp = await api_client.get(
-            f"{prefix}/network/interface/{TEST_INTERFACE_WLAN_NAME}/accesspoints"
+            f"/network/interface/{TEST_INTERFACE_WLAN_NAME}/accesspoints"
         )
     result = await resp.json()
 
@@ -426,17 +415,24 @@ async def test_api_network_reload(
     assert network_manager_service.CheckConnectivity.calls == [()]
 
 
+@pytest.mark.parametrize(
+    "vlan",
+    [
+        pytest.param(1, id="vlan"),
+        pytest.param(0, id="priority-tagging"),
+    ],
+)
 async def test_api_network_vlan(
-    api_client_with_prefix: tuple[TestClient, str],
+    api_client: TestClient,
     coresys: CoreSys,
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
+    vlan: int,
 ):
     """Test creating a vlan."""
-    api_client, prefix = api_client_with_prefix
     settings_service: SettingsService = network_manager_services["network_settings"]
     settings_service.AddConnection.calls.clear()
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/vlan/1",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/vlan/{vlan}",
         json={"ipv4": {"method": "auto"}, "llmnr": "off"},
     )
     result = await resp.json()
@@ -446,7 +442,7 @@ async def test_api_network_vlan(
     connection = settings_service.AddConnection.calls[0][0]
     assert "uuid" in connection["connection"]
     assert connection["connection"] == {
-        "id": Variant("s", "Supervisor eth0.1"),
+        "id": Variant("s", f"Supervisor eth0.{vlan}"),
         "type": Variant("s", "vlan"),
         "mdns": Variant("i", -1),  # Default mode
         "llmnr": Variant("i", 0),
@@ -456,19 +452,47 @@ async def test_api_network_vlan(
     assert connection["ipv4"] == {"method": Variant("s", "auto")}
     assert connection["ipv6"] == {"method": Variant("s", "auto")}
     assert connection["vlan"] == {
-        "id": Variant("u", 1),
+        "id": Variant("u", vlan),
+        "flags": Variant("u", 1),
         "parent": Variant("s", "0c23631e-2118-355c-bbb0-8943229cb0d6"),
     }
 
     # Check if trying to recreate an existing VLAN raises an exception
     result = await resp.json()
     resp = await api_client.post(
-        f"{prefix}/network/interface/{TEST_INTERFACE_ETH_NAME}/vlan/10",
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/vlan/10",
         json={"ipv4": {"method": "auto"}},
     )
     result = await resp.json()
     assert result["result"] == "error"
     assert len(settings_service.AddConnection.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "vlan",
+    [
+        pytest.param("abc", id="not-a-number"),
+        pytest.param("1.5", id="float"),
+        pytest.param("4095", id="reserved-4095"),
+        pytest.param("-1", id="negative"),
+    ],
+)
+async def test_api_network_vlan_invalid_id(
+    api_client: TestClient,
+    network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
+    vlan: str,
+):
+    """Test creating a vlan with an invalid id returns a client error."""
+    settings_service: SettingsService = network_manager_services["network_settings"]
+    settings_service.AddConnection.calls.clear()
+    resp = await api_client.post(
+        f"/network/interface/{TEST_INTERFACE_ETH_NAME}/vlan/{vlan}",
+        json={"ipv4": {"method": "auto"}},
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["message"] == f"Invalid VLAN ID {vlan}, must be between 0 and 4094"
+    assert settings_service.AddConnection.calls == []
 
 
 @pytest.mark.parametrize(
@@ -481,11 +505,61 @@ async def test_api_network_vlan(
     ],
 )
 async def test_network_interface_not_found(
-    api_client_with_prefix: tuple[TestClient, str], method: str, url: str
+    api_client: TestClient, method: str, url: str
 ):
     """Test network interface not found error."""
-    api_client, prefix = api_client_with_prefix
-    resp = await api_client.request(method, f"{prefix}{url}")
+    resp = await api_client.request(method, url)
     assert resp.status == 404
     body = await resp.json()
     assert body["message"] == "Interface bad does not exist"
+
+
+@pytest.mark.parametrize(
+    ("update", "expected_ssid"),
+    [
+        pytest.param(
+            {"enabled": True, "ipv4": {"method": "auto"}},
+            b"Caf\xe9",
+            id="ipv4_only_keeps_ssid",
+        ),
+        pytest.param(
+            {"enabled": True, "wifi": {"ssid": "Caf�"}},
+            b"Caf\xe9",
+            id="echoed_ssid_keeps_ssid",
+        ),
+        pytest.param(
+            {"enabled": True, "wifi": {"ssid": "Café"}},
+            "Café".encode(),
+            id="new_ssid_as_utf8",
+        ),
+    ],
+)
+async def test_api_network_interface_update_non_utf8_ssid(
+    api_client: TestClient,
+    coresys: CoreSys,
+    network_manager_service: NetworkManagerService,
+    update: dict[str, Any],
+    expected_ssid: bytes,
+):
+    """Test a stored non-UTF-8 SSID is only replaced when a new one is supplied."""
+    network_manager_service.AddAndActivateConnection.calls.clear()
+    resolved = await coresys.host.network.get_with_config(TEST_INTERFACE_WLAN_NAME)
+    resolved.interface.wifi = WifiConfig(
+        WifiMode.INFRASTRUCTURE, b"Caf\xe9", AuthMethod.OPEN, None, None
+    )
+
+    with (
+        patch.object(coresys.host.network, "get", return_value=resolved.interface),
+        patch.object(
+            coresys.host.network, "get_with_config", AsyncMock(return_value=resolved)
+        ),
+    ):
+        resp = await api_client.post(
+            f"/network/interface/{TEST_INTERFACE_WLAN_NAME}/update", json=update
+        )
+    result = await resp.json()
+    assert result["result"] == "ok", result
+
+    assert len(network_manager_service.AddAndActivateConnection.calls) == 1
+    settings = network_manager_service.AddAndActivateConnection.calls[0][0]
+    assert settings["802-11-wireless"]["ssid"] == Variant("ay", expected_ssid)

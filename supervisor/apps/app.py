@@ -68,22 +68,29 @@ from ..exceptions import (
     AppBackupMetadataInvalidError,
     AppBuildFailedUnknownError,
     AppConfigurationInvalidError,
+    AppFileReadError,
     AppNotRunningError,
+    AppNotSupportedArchitectureError,
     AppNotSupportedError,
     AppNotSupportedWriteStdinError,
     AppPortConflict,
     AppPrePostBackupCommandReturnedError,
     AppsError,
     AppsJobError,
+    AppStatsTimeoutError,
     AppUnknownError,
     BackupInvalidError,
     BackupRestoreUnknownError,
     ConfigurationFileError,
     DockerBuildError,
+    DockerContainerNotFoundError,
+    DockerContainerNotRunningError,
     DockerContainerPortConflict,
     DockerError,
     DockerNotFound,
     DockerRegistryAuthError,
+    DockerStatsTimeoutError,
+    HassioArchNotFound,
     HostAppArmorError,
     StoreAppNotFoundError,
 )
@@ -200,6 +207,8 @@ class App(AppModel):
                 return (
                     AppState.STARTUP if self.instance.healthcheck else AppState.STARTED
                 )
+            case ContainerState.STARTING:
+                return AppState.STARTUP
             case ContainerState.HEALTHY | ContainerState.UNHEALTHY:
                 return AppState.STARTED
             case ContainerState.STOPPED:
@@ -248,6 +257,10 @@ class App(AppModel):
                     and issue.reference == self.slug
                 ):
                     self.sys_resolution.dismiss_issue(issue)
+
+        # Home Assistant lists discovery messages only of started apps
+        if new_state != AppState.STARTED:
+            self.sys_discovery.mark_unannounced(self)
 
         # Dismiss device access missing issue if present and we stopped
         if new_state == AppState.STOPPED and (
@@ -937,15 +950,15 @@ class App(AppModel):
 
         await self.sys_run_in_executor(setup_data)
 
-        # Setup/Fix AppArmor profile
-        await self.install_apparmor()
-
-        # Install image
         try:
+            # Setup/Fix AppArmor profile
+            await self.install_apparmor()
+
+            # Install image
             await self.instance.install(
                 self.latest_version, self.app_store.image, arch=self.arch
             )
-        except AppsError:
+        except AppsError, HostAppArmorError:
             await self.sys_apps.data.uninstall(self)
             raise
         except DockerBuildError as err:
@@ -1057,7 +1070,11 @@ class App(AppModel):
         store = self.app_store.clone()
 
         try:
-            await self.instance.update(store.version, store.image, arch=self.arch)
+            # Use the store's architecture list to pick the image architecture. The
+            # installed version may not support any of the system's architectures
+            # anymore (e.g. after 32-bit support was dropped), while the new version
+            # does — availability of the store version was validated by the caller.
+            await self.instance.update(store.version, store.image, arch=store.arch)
         except DockerBuildError as err:
             _LOGGER.error("Could not build image for app %s: %s", self.slug, err)
             raise AppBuildFailedUnknownError(app=self.slug) from err
@@ -1109,6 +1126,14 @@ class App(AppModel):
         Returns a Task that completes when app has state 'started' (see start)
         if it was running. Else nothing is returned.
         """
+        # Resolve arch before removing the image so an unsupported app keeps it
+        try:
+            arch = self.arch
+        except HassioArchNotFound:
+            raise AppNotSupportedArchitectureError(
+                _LOGGER.error, app=self, architectures=self.supported_arch
+            ) from None
+
         last_state: AppState = self.state
         try:
             # remove docker container and image but not app config
@@ -1119,7 +1144,7 @@ class App(AppModel):
                 raise AppUnknownError(app=self.slug) from err
 
             try:
-                await self.instance.install(self.version)
+                await self.instance.install(self.version, arch=arch)
             except DockerBuildError as err:
                 _LOGGER.error("Could not build image for app %s: %s", self.slug, err)
                 raise AppBuildFailedUnknownError(app=self.slug) from err
@@ -1175,16 +1200,20 @@ class App(AppModel):
 
     async def install_apparmor(self) -> None:
         """Install or Update AppArmor profile for App."""
-        exists_local = self.sys_host.apparmor.exists(self.slug)
-        exists_app = await self.sys_run_in_executor(self.path_apparmor.exists)
+        # A refused profile must fail rather than drop the app's confinement
+        try:
+            profile_data = await self.sys_run_in_executor(
+                self.read_repository_file, self.path_apparmor
+            )
+        except OSError as err:
+            self.sys_resolution.check_oserror(err)
+            raise AppFileReadError(
+                _LOGGER.error, app=self.slug, error=str(err)
+            ) from err
 
-        # Nothing to do
-        if not exists_local and not exists_app:
-            return
-
-        # Need removed
-        if exists_local and not exists_app:
-            await self.sys_host.apparmor.remove_profile(self.slug)
+        if profile_data is None:
+            if self.sys_host.apparmor.exists(self.slug):
+                await self.sys_host.apparmor.remove_profile(self.slug)
             return
 
         # Need install/update
@@ -1193,8 +1222,10 @@ class App(AppModel):
         def install_update_profile() -> Path:
             nonlocal tmp_folder
             tmp_folder = TemporaryDirectory(dir=self.sys_config.path_tmp)
+            profile_source = Path(tmp_folder.name, "source.txt")
+            profile_source.write_bytes(profile_data)
             profile_file = Path(tmp_folder.name, "apparmor.txt")
-            adjust_profile(self.slug, self.path_apparmor, profile_file)
+            adjust_profile(self.slug, profile_source, profile_file)
             return profile_file
 
         try:
@@ -1374,13 +1405,14 @@ class App(AppModel):
         """
         return self.instance.is_running()
 
-    async def stats(self) -> DockerStats:
+    async def stats(self, *, one_shot: bool = False) -> DockerStats:
         """Return stats of container."""
         try:
-            if not await self.is_running():
-                raise AppNotRunningError(_LOGGER.warning, app=self.slug)
-
-            return await self.instance.stats()
+            return await self.instance.stats(one_shot=one_shot)
+        except (DockerContainerNotFoundError, DockerContainerNotRunningError) as err:
+            raise AppNotRunningError(_LOGGER.warning, app=self.slug) from err
+        except DockerStatsTimeoutError as err:
+            raise AppStatsTimeoutError(_LOGGER.error, app=self.slug) from err
         except DockerError as err:
             _LOGGER.error(
                 "Could not get stats of container for app %s: %s", self.slug, err
@@ -1681,13 +1713,15 @@ class App(AppModel):
                     else:
                         with suppress(DockerError):
                             await self.instance.install(
-                                version, restore_image, self.arch
+                                version, restore_image, arch=self.arch
                             )
                             await self.instance.cleanup()
                 elif self.instance.version != version or self.legacy:
                     _LOGGER.info("Restore/Update of image for app %s", self.slug)
                     with suppress(DockerError):
-                        await self.instance.update(version, restore_image, self.arch)
+                        await self.instance.update(
+                            version, restore_image, arch=self.arch
+                        )
                 await self._check_ingress_port()
 
                 # Restore data and config

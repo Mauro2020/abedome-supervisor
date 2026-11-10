@@ -21,10 +21,15 @@ class Settings(DBusServiceMock):
     interface = "org.freedesktop.NetworkManager.Settings"
     object_path = "/org/freedesktop/NetworkManager/Settings"
 
+    def __init__(self):
+        """Initialize object."""
+        super().__init__()
+        self.connections = ["/org/freedesktop/NetworkManager/Settings/1"]
+
     @dbus_property(access=PropertyAccess.READ)
     def Connections(self) -> "ao":
         """Get Connections."""
-        return ["/org/freedesktop/NetworkManager/Settings/1"]
+        return self.connections
 
     @dbus_property(access=PropertyAccess.READ)
     def Hostname(self) -> "s":
@@ -49,7 +54,7 @@ class Settings(DBusServiceMock):
     @dbus_method()
     def ListConnections(self) -> "ao":
         """Do ListConnections method."""
-        return self.Connections()
+        return self.Connections
 
     @dbus_method()
     def GetConnectionByUuid(self, uuid: "s") -> "o":

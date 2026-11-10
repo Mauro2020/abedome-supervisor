@@ -3,21 +3,64 @@
 from typing import Any, cast
 
 from aiohttp import web
+from awesomeversion import AwesomeVersion
 import voluptuous as vol
 
-from ..const import ATTR_NAME, ATTR_STATE
+from ..const import ATTR_NAME, ATTR_STATE, ATTR_TYPE, ATTR_UUID
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError, APINotFound
-from ..mounts.const import ATTR_DEFAULT_BACKUP_MOUNT, MountUsage
+from ..mounts.const import ATTR_DEFAULT_BACKUP_MOUNT, MountType, MountUsage
 from ..mounts.mount import Mount
-from ..mounts.validate import SCHEMA_MOUNT_CONFIG, MountData
-from .const import ATTR_MOUNTS, ATTR_USER_PATH
-from .utils import api_process, api_validate
+from ..mounts.validate import (
+    SCHEMA_BASE_MOUNT_CONFIG,
+    SCHEMA_MOUNT_CIFS,
+    SCHEMA_MOUNT_NFS,
+    MountData,
+    usage_specific_validation,
+)
+from .const import ATTR_DEVICE, ATTR_MOUNTS, ATTR_USER_PATH
+from .utils import api_process, api_validate, client_library_version
+
+# aiohasupervisor before 0.7.0 fails to parse a mount of unknown type, which
+# breaks the hassio integration in Core. Hide disk mounts from those clients.
+CLIENT_LIBRARY_DISK_MOUNT_MIN_VERSION = AwesomeVersion("0.7.0")
 
 SCHEMA_OPTIONS = vol.Schema(
     {
         vol.Optional(ATTR_DEFAULT_BACKUP_MOUNT): vol.Maybe(str),
     }
+)
+
+
+def _device_identifier_required(config: dict[str, Any]) -> dict[str, Any]:
+    """Require at least one of device and uuid for a disk mount."""
+    if not config.get(ATTR_DEVICE) and not config.get(ATTR_UUID):
+        raise vol.Invalid("Disk mounts require either device or uuid")
+
+    return config
+
+
+# API input only; persisted mounts use mounts/validate.py. Both identifiers
+# may be supplied so a /host/disks partition can be posted back: uuid drives
+# resolution and device is checked for agreement. filesystem is omitted so
+# UDisks2 resolution always runs the mountable-device guard; REMOVE_EXTRA
+# drops a value echoed from GET /mounts.
+_SCHEMA_MOUNT_DISK = vol.All(
+    SCHEMA_BASE_MOUNT_CONFIG.extend(
+        {
+            vol.Required(ATTR_TYPE): vol.All(
+                MountType.DISK.value, vol.Coerce(MountType)
+            ),
+            vol.Optional(ATTR_DEVICE): str,
+            vol.Optional(ATTR_UUID): str,
+        }
+    ),
+    _device_identifier_required,
+)
+
+SCHEMA_MOUNT_CONFIG = vol.All(
+    vol.Any(SCHEMA_MOUNT_CIFS, SCHEMA_MOUNT_NFS, _SCHEMA_MOUNT_DISK),
+    usage_specific_validation,
 )
 
 
@@ -34,9 +77,21 @@ class APIMounts(CoreSysAttributes):
     @api_process
     async def info(self, request: web.Request) -> dict[str, Any]:
         """Return MountManager info."""
+        client_version = client_library_version(request)
+        hide_disk = (
+            client_version is not None
+            and client_version < CLIENT_LIBRARY_DISK_MOUNT_MIN_VERSION
+        )
+
+        def visible(mount: Mount) -> bool:
+            return not (hide_disk and mount.type == MountType.DISK)
+
+        # A hidden default backup mount reads as local backups, which keeps
+        # the client's default consistent with the mounts it can see.
+        default = self.sys_mounts.default_backup_mount
         return {
-            ATTR_DEFAULT_BACKUP_MOUNT: self.sys_mounts.default_backup_mount.name
-            if self.sys_mounts.default_backup_mount
+            ATTR_DEFAULT_BACKUP_MOUNT: default.name
+            if default and visible(default)
             else None,
             ATTR_MOUNTS: [
                 mount.to_dict()
@@ -47,6 +102,7 @@ class APIMounts(CoreSysAttributes):
                     else None,
                 }
                 for mount in self.sys_mounts.mounts
+                if visible(mount)
             ],
         }
 

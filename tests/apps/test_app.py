@@ -1,11 +1,14 @@
 """Test Home Assistant Apps."""
 
 import asyncio
+from collections.abc import Callable
 from datetime import timedelta
 import errno
 from http import HTTPStatus
 import logging
+import os
 from pathlib import Path, PurePath
+from tarfile import TarFile
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
@@ -17,7 +20,7 @@ from securetar import SecureTarArchive, SecureTarFile
 
 from supervisor.apps.app import App
 from supervisor.apps.const import AppBackupMode
-from supervisor.apps.model import AppModel
+from supervisor.apps.model import AppModel, read_in_repository, resolve_in_repository
 from supervisor.const import (
     ATTR_ADVANCED,
     ATTR_LOCATION,
@@ -34,15 +37,28 @@ from supervisor.docker.manager import CommandReturn, DockerAPI
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import (
     AppFileReadError,
+    AppNotRunningError,
+    AppNotSupportedArchitectureError,
     AppPortConflict,
     AppPrePostBackupCommandReturnedError,
+    AppRepositoryFileUnsafeError,
+    AppsError,
     AppsJobError,
+    AppStatsTimeoutError,
     AppUnknownError,
     AudioUpdateError,
+    DockerAPIError,
+    DockerContainerNotFoundError,
+    DockerContainerNotRunningError,
+    DockerError,
     DockerRegistryAuthError,
+    DockerStatsTimeoutError,
     HassioError,
+    HostAppArmorError,
+    StoreRepositoryFileUnsafeError,
 )
 from supervisor.hardware.helper import HwHelper
+from supervisor.homeassistant.api import APIState
 from supervisor.homeassistant.const import WSType
 from supervisor.ingress import Ingress
 from supervisor.resolution.const import (
@@ -52,11 +68,18 @@ from supervisor.resolution.const import (
     UnhealthyReason,
 )
 from supervisor.resolution.data import Issue
+from supervisor.store.app import AppStore
 from supervisor.utils.dt import utcnow
 
 from .test_manager import BOOT_FAIL_ISSUE, BOOT_FAIL_SUGGESTIONS
 
-from tests.common import fire_bus_event, force_app_state, get_fixture_path, is_in_list
+from tests.common import (
+    MockResponse,
+    fire_bus_event,
+    force_app_state,
+    get_fixture_path,
+    is_in_list,
+)
 from tests.const import TEST_ADDON_SLUG
 
 
@@ -155,6 +178,11 @@ async def test_app_state_listener(coresys: CoreSys, install_app_ssh: App) -> Non
         assert install_app_ssh.state == AppState.STOPPED
 
         await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STARTING
+        )
+        assert install_app_ssh.state == AppState.STARTUP
+
+        await _fire_test_event(
             coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.HEALTHY
         )
         assert install_app_ssh.state == AppState.STARTED
@@ -207,6 +235,162 @@ async def test_app_state_event_name_compatibility(
             },
         }
     )
+
+
+@pytest.mark.parametrize(
+    "not_started_state",
+    [
+        pytest.param(AppState.ERROR, id="error"),
+        pytest.param(AppState.STOPPED, id="stopped"),
+        pytest.param(AppState.STARTUP, id="startup"),
+    ],
+)
+async def test_app_not_started_pushes_next_discovery_send(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    install_app_example: App,
+    websession: MagicMock,
+    not_started_state: AppState,
+) -> None:
+    """Test the first discovery send after an app was not started is pushed.
+
+    Home Assistant lists discovery messages only of started apps, so it may have
+    missed the message in the meantime.
+    """
+    coresys.homeassistant.api._ensure_access_token = AsyncMock()  # pylint: disable=protected-access
+    websession.request.return_value = MockResponse()
+    force_app_state(install_app_ssh, AppState.STARTED)
+    force_app_state(install_app_example, AppState.STARTED)
+    message = await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.discovery.send(install_app_example, "test", {})
+    await coresys.block_till_done()
+    websession.request.reset_mock()
+
+    force_app_state(install_app_ssh, not_started_state)
+    force_app_state(install_app_ssh, AppState.STARTED)
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+
+    websession.request.assert_called_once()
+    assert websession.request.call_args.args[0] == "post"
+    assert (
+        str(websession.request.call_args.args[1])
+        == f"http://172.30.32.1/api/hassio_push/discovery/{message.uuid}"
+    )
+    assert websession.request.call_args.kwargs["json"] == {
+        "addon": TEST_ADDON_SLUG,
+        "service": "test",
+        "uuid": message.uuid,
+    }
+
+    # Only the first send is pushed, and the app which kept running is not
+    websession.request.reset_mock()
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.discovery.send(install_app_example, "test", {})
+    await coresys.block_till_done()
+    websession.request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state_at_push_end",
+    [
+        pytest.param(AppState.STOPPED, id="stopped"),
+        pytest.param(AppState.STARTED, id="restarted"),
+    ],
+)
+async def test_app_stopped_during_discovery_push_pushes_next_send(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    websession: MagicMock,
+    state_at_push_end: AppState,
+) -> None:
+    """Test the next send is pushed if the app stopped while its push was running.
+
+    The push reached Home Assistant, but the app's next start needs it again.
+    """
+    coresys.homeassistant.api._ensure_access_token = AsyncMock()  # pylint: disable=protected-access
+    websession.request.return_value = MockResponse()
+    force_app_state(install_app_ssh, AppState.STARTED)
+
+    async def stop_app_during_push() -> APIState:
+        force_app_state(install_app_ssh, AppState.STOPPED)
+        force_app_state(install_app_ssh, state_at_push_end)
+        return APIState("RUNNING", False)
+
+    coresys.homeassistant.api.get_api_state.side_effect = stop_app_during_push
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+    websession.request.assert_called_once()
+
+    # Started again, the app sends the unchanged message
+    coresys.homeassistant.api.get_api_state.side_effect = None
+    websession.request.reset_mock()
+    force_app_state(install_app_ssh, AppState.STARTED)
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+    websession.request.assert_called_once()
+
+
+async def test_app_restarted_during_discovery_save_pushes_next_send(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    websession: MagicMock,
+) -> None:
+    """Test the next send is pushed if the app restarted during a send's save.
+
+    The push of that earlier send does not count for the new start.
+    """
+    coresys.homeassistant.api._ensure_access_token = AsyncMock()  # pylint: disable=protected-access
+    websession.request.return_value = MockResponse()
+    force_app_state(install_app_ssh, AppState.STARTED)
+
+    async def restart_app_during_save() -> None:
+        force_app_state(install_app_ssh, AppState.STOPPED)
+        force_app_state(install_app_ssh, AppState.STARTED)
+
+    with patch.object(
+        coresys.discovery, "save_data", side_effect=restart_app_during_save
+    ):
+        await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+    websession.request.assert_called_once()
+
+    # The restarted app sends the unchanged message
+    websession.request.reset_mock()
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+    websession.request.assert_called_once()
+
+
+async def test_app_discovery_send_in_startup_pushes_next_send(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    websession: MagicMock,
+) -> None:
+    """Test the next send is pushed if the app sent before it was started.
+
+    An app with a healthcheck can send before it is ready for Home Assistant.
+    """
+    coresys.homeassistant.api._ensure_access_token = AsyncMock()  # pylint: disable=protected-access
+    websession.request.return_value = MockResponse()
+    force_app_state(install_app_ssh, AppState.STARTED)
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+
+    # The app restarts and sends before its healthcheck passed
+    force_app_state(install_app_ssh, AppState.STOPPED)
+    force_app_state(install_app_ssh, AppState.STARTUP)
+    websession.request.reset_mock()
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+    websession.request.assert_called_once()
+
+    # Started now, the app sends the unchanged message
+    force_app_state(install_app_ssh, AppState.STARTED)
+    websession.request.reset_mock()
+    await coresys.discovery.send(install_app_ssh, "test", {})
+    await coresys.block_till_done()
+    websession.request.assert_called_once()
 
 
 async def test_app_failed_logs_exit_code(
@@ -301,6 +485,14 @@ async def test_app_watchdog(coresys: CoreSys, install_app_ssh: App) -> None:
             f"app_{TEST_ADDON_SLUG}",
             ContainerState.FAILED,
             exit_code=1,
+        )
+        restart.assert_not_called()
+        start.assert_not_called()
+
+        # Do not restart while the healthcheck is still starting
+        current_state.return_value = ContainerState.STARTING
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STARTING
         )
         restart.assert_not_called()
         start.assert_not_called()
@@ -500,7 +692,10 @@ async def test_listeners_removed_on_uninstall(
             listener in coresys.bus._listeners[BusEvent.DOCKER_CONTAINER_STATE_CHANGE]
         )
 
-    with patch.object(App, "persist", new=PropertyMock(return_value=MagicMock())):
+    with (
+        patch.object(App, "persist", new=PropertyMock(return_value=MagicMock())),
+        patch.object(Ingress, "update_hass_panel"),
+    ):
         await coresys.apps.uninstall(TEST_ADDON_SLUG)
 
     for listener in listeners:
@@ -510,16 +705,76 @@ async def test_listeners_removed_on_uninstall(
         )
 
 
+@pytest.mark.parametrize(
+    ("config", "state", "expected"),
+    [
+        pytest.param({}, {}, AppState.STARTED, id="no-healthcheck"),
+        pytest.param(
+            {"Healthcheck": "exists"},
+            {"Health": {"Status": "starting"}},
+            AppState.STARTUP,
+            id="health-starting",
+        ),
+        pytest.param(
+            {"Healthcheck": "exists"},
+            {"Health": {"Status": "healthy"}},
+            AppState.STARTED,
+            id="health-healthy",
+        ),
+        pytest.param(
+            {"Healthcheck": "exists"},
+            {"Health": {"Status": "unhealthy"}},
+            AppState.STARTED,
+            id="health-unhealthy",
+        ),
+    ],
+)
 @pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
 async def test_load_settles_state_from_running_container(
-    install_app_ssh: App, container: DockerContainer
+    install_app_ssh: App,
+    container: DockerContainer,
+    config: dict[str, Any],
+    state: dict[str, Any],
+    expected: AppState,
 ) -> None:
     """Test load derives the state from a running container, not the default."""
-    container.show.return_value["State"]["Status"] = "running"
-    container.show.return_value["State"]["Running"] = True
+    container.show.return_value["Config"] = config
+    container.show.return_value["State"] |= {"Status": "running", "Running": True}
+    container.show.return_value["State"] |= state
     await install_app_ssh.load()
     # State is settled synchronously from current_state(), so it reflects the
     # running container immediately rather than the image-only STOPPED default.
+    assert install_app_ssh.state == expected
+
+
+@pytest.mark.parametrize("state", [ContainerState.HEALTHY, ContainerState.UNHEALTHY])
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_start_running_healthcheck_starting_waits(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+    state: ContainerState,
+) -> None:
+    """Test start on a container in its healthcheck start period waits for health."""
+    container.show.return_value["Config"] = {"Healthcheck": "exists"}
+    container.show.return_value["State"] |= {
+        "Status": "running",
+        "Running": True,
+        "Health": {"Status": "starting"},
+    }
+    await install_app_ssh.load()
+    await asyncio.sleep(0)
+    assert install_app_ssh.state == AppState.STARTUP
+
+    start_task = await install_app_ssh.start()
+    await asyncio.sleep(0)
+
+    assert not start_task.done()
+    assert install_app_ssh.state == AppState.STARTUP
+
+    await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", state)
+
+    assert start_task.done()
     assert install_app_ssh.state == AppState.STARTED
 
 
@@ -558,6 +813,11 @@ async def test_start_wait_healthcheck(
     assert start_task
 
     await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+
+    assert not start_task.done()
+    assert install_app_ssh.state == AppState.STARTUP
+
+    await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STARTING)
 
     assert not start_task.done()
     assert install_app_ssh.state == AppState.STARTUP
@@ -604,6 +864,29 @@ async def test_restart(coresys: CoreSys, install_app_ssh: App) -> None:
     await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
     await start_task
     assert install_app_ssh.state == AppState.STARTED
+
+
+@pytest.mark.parametrize(
+    ("docker_error", "expected_error"),
+    [
+        (DockerContainerNotFoundError(name="app_local_ssh"), AppNotRunningError),
+        (DockerContainerNotRunningError(name="app_local_ssh"), AppNotRunningError),
+        (DockerStatsTimeoutError(name="app_local_ssh"), AppStatsTimeoutError),
+        (DockerAPIError(), AppUnknownError),
+    ],
+)
+async def test_stats_failures(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    docker_error: DockerError,
+    expected_error: type[AppsError],
+) -> None:
+    """Test container stats errors are translated to app-flavored errors."""
+    with (
+        patch.object(DockerAPI, "container_stats", AsyncMock(side_effect=docker_error)),
+        pytest.raises(expected_error),
+    ):
+        await install_app_ssh.stats()
 
 
 @pytest.mark.parametrize("status", ["running", "stopped"])
@@ -680,7 +963,7 @@ async def test_backup_with_pre_post_command(
 
 @pytest.mark.parametrize(
     (
-        "container_get_side_effect",
+        "exec_side_effect",
         "exec_start_side_effect",
         "exec_inspect_side_effect",
         "exc_type_raised",
@@ -717,13 +1000,13 @@ async def test_backup_with_pre_post_command(
 async def test_backup_with_pre_command_error(
     coresys: CoreSys,
     install_app_ssh: App,
-    container_get_side_effect: aiodocker.DockerError | None,
+    exec_side_effect: aiodocker.DockerError | None,
     exec_start_side_effect: aiodocker.DockerError | None,
     exec_inspect_side_effect: aiodocker.DockerError | list[dict[str, Any]] | None,
     exc_type_raised: type[HassioError],
 ) -> None:
     """Test backing up an app with error running pre command."""
-    coresys.docker.containers.get.side_effect = container_get_side_effect
+    coresys.docker.containers.get.return_value.exec.side_effect = exec_side_effect
     coresys.docker.containers.get.return_value.exec.return_value.start.side_effect = (
         exec_start_side_effect
     )
@@ -905,6 +1188,57 @@ async def test_restore_while_running_with_watchdog(
         restart.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("image_exists", "method"),
+    [
+        pytest.param(False, "install", id="image-missing"),
+        pytest.param(True, "update", id="version-mismatch"),
+    ],
+)
+@pytest.mark.usefixtures(
+    "tmp_supervisor_data", "path_extern", "mock_aarch64_arch_supported"
+)
+async def test_restore_pulls_image_for_app_arch(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    tmp_path: Path,
+    image_exists: bool,
+    method: str,
+) -> None:
+    """Test restore pulls the image for the app's arch without tagging latest."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    # Drop the bundled image so restore has to pull it from the registry
+    backup_path = tmp_path / "backup.tar.gz"
+    with (
+        TarFile.open(get_fixture_path("backup_local_ssh_stopped.tar.gz")) as src,
+        TarFile.open(backup_path, "w:gz") as dest,
+    ):
+        for member in src.getmembers():
+            if member.name != "./image.tar":
+                dest.addfile(member, src.extractfile(member))
+
+    tarfile = SecureTarFile(backup_path)
+    with (
+        patch.object(DockerApp, "is_running", return_value=False),
+        patch.object(DockerApp, "exists", new=AsyncMock(return_value=image_exists)),
+        patch.object(
+            DockerApp,
+            "version",
+            new=PropertyMock(return_value=AwesomeVersion("0.0.0")),
+        ),
+        patch.object(DockerApp, "cleanup", new=AsyncMock()),
+        patch.object(DockerApp, method, new=AsyncMock()) as pull_mock,
+    ):
+        await coresys.apps.restore(TEST_ADDON_SLUG, tarfile)
+
+    pull_mock.assert_called_once()
+    assert len(pull_mock.call_args.args) == 2
+    assert pull_mock.call_args.kwargs == {"arch": install_app_ssh.arch}
+
+
 @pytest.mark.usefixtures("coresys")
 async def test_start_when_running(
     install_app_ssh: App,
@@ -998,6 +1332,25 @@ async def test_app_rebuild_auth_failure(coresys: CoreSys, install_app_example: A
         await install_app_example.rebuild()
 
 
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_app_rebuild_unsupported_arch_keeps_image(
+    coresys: CoreSys, install_app_example: App
+) -> None:
+    """Test rebuild fails before removing the image if no arch is supported."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_example.data["arch"] = ["armv7"]
+
+    with (
+        patch.object(DockerApp, "remove") as remove,
+        patch.object(DockerApp, "install") as install,
+        pytest.raises(AppNotSupportedArchitectureError),
+    ):
+        await install_app_example.rebuild()
+
+    remove.assert_not_called()
+    install.assert_not_called()
+
+
 @pytest.mark.usefixtures("coresys", "path_extern")
 async def test_local_example_start(tmp_supervisor_data: Path, install_app_example: App):
     """Test start of an app."""
@@ -1061,50 +1414,38 @@ async def test_app_pulse_error(
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_long_description_bad_message(coresys: CoreSys, install_app_example: App):
-    """Test long_description raises AppFileReadError and marks unhealthy on EBADMSG."""
-    err = OSError()
-    err.errno = errno.EBADMSG
-    with (
-        patch("supervisor.apps.model.Path.exists", side_effect=err),
-        pytest.raises(AppFileReadError),
-    ):
-        await install_app_example.long_description()
-
-    assert coresys.core.healthy is False
-    assert UnhealthyReason.OSERROR_BAD_MESSAGE in coresys.resolution.unhealthy
-
-
-@pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_long_description_other_oserror(
-    coresys: CoreSys, install_app_example: App
+@pytest.mark.parametrize(
+    ("error", "healthy"),
+    [
+        pytest.param(errno.EBADMSG, False, id="bad-message"),
+        pytest.param(errno.EIO, True, id="other-oserror"),
+    ],
+)
+async def test_long_description_oserror(
+    coresys: CoreSys, install_app_example: App, error: int, healthy: bool
 ):
-    """Test long_description raises AppFileReadError without unhealthy on other OSError."""
-    err = OSError()
-    err.errno = errno.EIO
-    with (
-        patch("supervisor.apps.model.Path.exists", side_effect=err),
-        pytest.raises(AppFileReadError),
+    """Test an unreadable README is treated as absent and checked for unhealthy."""
+    with patch(
+        "supervisor.apps.model.resolve_in_repository",
+        side_effect=OSError(error, os.strerror(error)),
     ):
-        await install_app_example.long_description()
+        assert await install_app_example.long_description() is None
 
-    assert coresys.core.healthy is True
+    assert coresys.core.healthy is healthy
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
 async def test_refresh_path_cache_bad_message(
     coresys: CoreSys, install_app_example: App
 ):
-    """Test refresh_path_cache raises AppFileReadError and marks unhealthy on EBADMSG."""
-    err = OSError()
-    err.errno = errno.EBADMSG
-    with (
-        patch("supervisor.apps.model.Path.exists", side_effect=err),
-        pytest.raises(AppFileReadError),
+    """Test an unreadable asset is treated as absent and marks unhealthy on EBADMSG."""
+    with patch(
+        "supervisor.apps.model.resolve_in_repository",
+        side_effect=OSError(errno.EBADMSG, os.strerror(errno.EBADMSG)),
     ):
         await install_app_example.refresh_path_cache()
 
-    assert coresys.core.healthy is False
+    assert not install_app_example.with_icon
     assert UnhealthyReason.OSERROR_BAD_MESSAGE in coresys.resolution.unhealthy
 
 
@@ -1151,7 +1492,10 @@ async def test_paths_cache(coresys: CoreSys, install_app_ssh: App):
     assert not install_app_ssh.with_documentation
 
     with (
-        patch("supervisor.apps.app.Path.exists", return_value=True),
+        patch(
+            "supervisor.apps.model.AppModel.optional_repository_file",
+            return_value=Path("icon.png"),
+        ),
         patch("supervisor.store.repository.RepositoryLocal.update", return_value=True),
     ):
         await coresys.store.reload(coresys.store.get("local"))
@@ -1160,6 +1504,188 @@ async def test_paths_cache(coresys: CoreSys, install_app_ssh: App):
         assert install_app_ssh.with_icon
         assert install_app_ssh.with_changelog
         assert install_app_ssh.with_documentation
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        pytest.param("app/icon.png", "app/icon.png", id="plain-file"),
+        pytest.param("app/logo.png", "shared/icon.png", id="in-repo-symlink"),
+        pytest.param("app/banner.png", ".github/icon.png", id="dot-github-symlink"),
+    ],
+)
+def test_resolve_in_repository(tmp_path: Path, path: str, expected: str):
+    """Test repository confinement resolves in-repo files and symlinks."""
+    repo = tmp_path / "repo"
+    (repo / "app").mkdir(parents=True)
+    (repo / "shared").mkdir()
+    (repo / "shared" / "icon.png").write_bytes(b"x")
+    (repo / "app" / "icon.png").write_bytes(b"x")
+    (repo / "app" / "logo.png").symlink_to(Path("..", "shared", "icon.png"))
+    (repo / ".github").mkdir()
+    (repo / ".github" / "icon.png").write_bytes(b"x")
+    (repo / "app" / "banner.png").symlink_to(Path("..", ".github", "icon.png"))
+
+    assert resolve_in_repository(repo / path, repo) == repo / expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("missing.png", id="missing"),
+        pytest.param("directory.png", id="directory"),
+    ],
+)
+def test_resolve_in_repository_missing(tmp_path: Path, name: str):
+    """Test a missing file or a non-regular file raises FileNotFoundError."""
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "directory.png").symlink_to("shared")
+
+    with pytest.raises(FileNotFoundError):
+        resolve_in_repository(tmp_path / name, tmp_path)
+
+
+def test_read_in_repository(tmp_path: Path):
+    """Test reading a repository file follows in-repo symlinks."""
+    (tmp_path / "icon.png").write_bytes(b"icon")
+    (tmp_path / "logo.png").symlink_to("icon.png")
+
+    assert read_in_repository(tmp_path / "logo.png", tmp_path) == b"icon"
+
+
+def test_read_in_repository_swapped_after_resolve(tmp_path: Path):
+    """Test the opened file is checked again if it changed after resolving."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "icon.png").write_bytes(b"icon")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"secret")
+
+    # Resolving sees the in-repo file, the open then hits the swapped-in one
+    with (
+        patch("supervisor.apps.model.resolve_in_repository", return_value=outside),
+        pytest.raises(StoreRepositoryFileUnsafeError, match="outside repository"),
+    ):
+        read_in_repository(repo / "icon.png", repo)
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_repository_file_outside_registered_repository(store_app: AppStore):
+    """Test files of an app located outside its registered repository are refused."""
+    store_app.path_icon.write_bytes(b"icon")
+
+    with pytest.raises(AppRepositoryFileUnsafeError):
+        store_app.resolve_repository_file(store_app.path_icon)
+
+
+@pytest.mark.parametrize(
+    ("link_target", "match"),
+    [
+        pytest.param(
+            lambda repo, link: repo.parent / "outside.png",
+            "resolves outside repository",
+            id="escape",
+        ),
+        pytest.param(
+            lambda repo, link: repo / ".git" / "config",
+            "resolves into .git",
+            id="git-directory",
+        ),
+        pytest.param(lambda repo, link: link, "cannot be resolved", id="loop"),
+        pytest.param(
+            lambda repo, link: Path("a" * 300), "cannot be resolved", id="too-long"
+        ),
+    ],
+)
+def test_resolve_in_repository_refused(
+    tmp_path: Path, link_target: Callable[[Path, Path], Path], match: str
+):
+    """Test repository confinement refuses symlinks that must not be read."""
+    repo = tmp_path / "repo"
+    (repo / "app").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / ".git" / "config").write_text("url = https://user:token@example.com")
+    (tmp_path / "outside.png").write_bytes(b"x")
+    link = repo / "app" / "icon.png"
+    link.symlink_to(link_target(repo, link))
+
+    with pytest.raises(StoreRepositoryFileUnsafeError, match=match):
+        resolve_in_repository(link, repo)
+
+
+async def test_install_apparmor_missing_profile_removed(
+    coresys: CoreSys, install_app_ssh: App
+):
+    """Test the local profile is removed when the app no longer ships one."""
+    with (
+        patch.object(App, "read_repository_file", return_value=None),
+        patch.object(type(coresys.host.apparmor), "exists", return_value=True),
+        patch.object(
+            type(coresys.host.apparmor), "remove_profile", new=AsyncMock()
+        ) as remove_profile,
+    ):
+        await install_app_ssh.install_apparmor()
+
+    remove_profile.assert_called_once_with(install_app_ssh.slug)
+
+
+async def test_install_apparmor_refused_profile_kept(
+    coresys: CoreSys, install_app_ssh: App
+):
+    """Test a profile refused by repository confinement fails instead of being removed."""
+    with (
+        patch(
+            "supervisor.apps.model.resolve_in_repository",
+            side_effect=StoreRepositoryFileUnsafeError("escapes"),
+        ),
+        patch.object(type(coresys.host.apparmor), "exists", return_value=True),
+        patch.object(
+            type(coresys.host.apparmor), "remove_profile", new=AsyncMock()
+        ) as remove_profile,
+        pytest.raises(AppRepositoryFileUnsafeError),
+    ):
+        await install_app_ssh.install_apparmor()
+
+    remove_profile.assert_not_called()
+
+
+async def test_install_apparmor_bad_message(coresys: CoreSys, install_app_ssh: App):
+    """Test install_apparmor raises AppFileReadError and marks unhealthy on EBADMSG."""
+    with (
+        patch.object(
+            App,
+            "read_repository_file",
+            side_effect=OSError(errno.EBADMSG, os.strerror(errno.EBADMSG)),
+        ),
+        pytest.raises(AppFileReadError),
+    ):
+        await install_app_ssh.install_apparmor()
+
+    assert UnhealthyReason.OSERROR_BAD_MESSAGE in coresys.resolution.unhealthy
+
+
+@pytest.mark.usefixtures("test_repository", "tmp_supervisor_data")
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            AppFileReadError(app="local_example", error="EIO"), id="read-error"
+        ),
+        pytest.param(HostAppArmorError(), id="apparmor-error"),
+    ],
+)
+async def test_app_install_apparmor_failure(coresys: CoreSys, error: Exception):
+    """Test app data is cleaned up when the AppArmor profile cannot be installed."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with (
+        patch.object(App, "install_apparmor", side_effect=error),
+        pytest.raises(type(error)),
+    ):
+        await coresys.apps.install("local_example")
+
+    assert "local_example" not in coresys.apps.data.user
+    assert "local_example" not in coresys.apps.local
 
 
 @pytest.mark.usefixtures("mock_amd64_arch_supported")

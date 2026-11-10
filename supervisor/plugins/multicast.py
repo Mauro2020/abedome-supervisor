@@ -12,10 +12,18 @@ from ..docker.const import ContainerState
 from ..docker.multicast import DockerMulticast
 from ..docker.stats import DockerStats
 from ..exceptions import (
+    DockerContainerNotFoundError,
+    DockerContainerNotRunningError,
     DockerError,
+    DockerStatsTimeoutError,
+    MulticastDisabledError,
     MulticastError,
     MulticastJobError,
+    MulticastNotRunningError,
+    MulticastStatsTimeoutError,
+    MulticastUnknownError,
     MulticastUpdateError,
+    PluginDisabledError,
     PluginError,
 )
 from ..jobs.const import JobThrottle
@@ -56,6 +64,29 @@ class PluginMulticast(PluginBase):
         return self.sys_updater.version_multicast
 
     @Job(
+        name="plugin_multicast_enable",
+        conditions=PLUGIN_UPDATE_CONDITIONS,
+        on_condition=MulticastJobError,
+    )
+    async def enable(self) -> None:
+        """Enable, install and start the Multicast plugin."""
+        try:
+            await super().enable()
+        except (DockerError, PluginError) as err:
+            raise MulticastError(
+                "Can't enable Multicast plugin", _LOGGER.error
+            ) from err
+
+    async def disable(self) -> None:
+        """Disable the Multicast plugin and remove its container and image."""
+        try:
+            await super().disable()
+        except (DockerError, PluginError) as err:
+            raise MulticastError(
+                "Can't disable Multicast plugin", _LOGGER.error
+            ) from err
+
+    @Job(
         name="plugin_multicast_update",
         conditions=PLUGIN_UPDATE_CONDITIONS,
         on_condition=MulticastJobError,
@@ -64,6 +95,8 @@ class PluginMulticast(PluginBase):
         """Update Multicast plugin."""
         try:
             await super().update(version)
+        except PluginDisabledError as err:
+            raise MulticastDisabledError(_LOGGER.error) from err
         except (DockerError, PluginError) as err:
             raise MulticastUpdateError(
                 "Multicast update failed", _LOGGER.error
@@ -71,14 +104,21 @@ class PluginMulticast(PluginBase):
 
     async def restart(self) -> None:
         """Restart Multicast plugin."""
-        _LOGGER.info("Restarting Multicast plugin")
-        try:
-            await self.instance.restart()
-        except DockerError as err:
-            raise MulticastError("Can't start Multicast plugin", _LOGGER.error) from err
+        async with self._lifecycle_lock:
+            if not self.enabled:
+                raise MulticastDisabledError(_LOGGER.error)
+            _LOGGER.info("Restarting Multicast plugin")
+            try:
+                await self.instance.restart()
+            except DockerError as err:
+                raise MulticastError(
+                    "Can't start Multicast plugin", _LOGGER.error
+                ) from err
 
     async def start(self) -> None:
         """Run Multicast."""
+        if not self.enabled:
+            raise MulticastDisabledError(_LOGGER.error)
         _LOGGER.info("Starting Multicast plugin")
         try:
             await self.instance.run()
@@ -93,24 +133,30 @@ class PluginMulticast(PluginBase):
         except DockerError as err:
             raise MulticastError("Can't stop Multicast plugin", _LOGGER.error) from err
 
-    async def stats(self) -> DockerStats:
+    async def stats(self, *, one_shot: bool = False) -> DockerStats:
         """Return stats of Multicast."""
         try:
-            return await self.instance.stats()
+            return await self.instance.stats(one_shot=one_shot)
+        except (DockerContainerNotFoundError, DockerContainerNotRunningError) as err:
+            raise MulticastNotRunningError(_LOGGER.warning) from err
+        except DockerStatsTimeoutError as err:
+            raise MulticastStatsTimeoutError(_LOGGER.error) from err
         except DockerError as err:
-            raise MulticastError from err
+            _LOGGER.error("Could not get stats of container for Multicast: %s", err)
+            raise MulticastUnknownError from err
 
     async def repair(self) -> None:
         """Repair Multicast plugin."""
-        if await self.instance.exists():
-            return
+        async with self._lifecycle_lock:
+            if not self.enabled or await self.instance.exists():
+                return
 
-        _LOGGER.info("Repairing Multicast %s", self.version)
-        try:
-            await self.instance.install(self.version)
-        except DockerError as err:
-            _LOGGER.error("Repair of Multicast failed")
-            await async_capture_exception(err)
+            _LOGGER.info("Repairing Multicast %s", self.version)
+            try:
+                await self.instance.install(self.version)
+            except DockerError as err:
+                _LOGGER.error("Repair of Multicast failed")
+                await async_capture_exception(err)
 
     @Job(
         name="plugin_multicast_restart_after_problem",

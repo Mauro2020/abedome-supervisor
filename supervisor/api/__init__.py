@@ -1,28 +1,39 @@
 """Init file for Supervisor RESTful API."""
 
+import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 import logging
 from pathlib import Path
 from typing import Any
+import weakref
 
-from aiohttp import hdrs, web
+from aiohttp import WSCloseCode, hdrs, web
 
 from ..apps.app import App
-from ..const import SUPERVISOR_DOCKER_NAME, AppState, FeatureFlag
+from ..const import (
+    SOCKET_NAME_SUPERVISOR,
+    SUPERVISOR_DOCKER_NAME,
+    WEBSOCKET_CLOSE_TIMEOUT,
+    AppState,
+    FeatureFlag,
+)
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
     APIAppNotInstalled,
+    APISocketError,
     HostJournalGatewaydConnectionError,
     HostNotSupportedError,
 )
+from ..host.const import LogFormatter
 from ..utils.sentry import async_capture_exception
 from .apps import APIApps
 from .audio import APIAudio
 from .auth import APIAuth
 from .backups import APIBackups
 from .cli import APICli
-from .const import CONTENT_TYPE_TEXT, AppVersion
+from .const import CONTENT_TYPE_TEXT, WEBSOCKETS, AppVersion
 from .discovery import APIDiscovery
 from .dns import APICoreDNS
 from .docker import APIDocker
@@ -42,14 +53,19 @@ from .resolution import APIResolution
 from .root import APIRoot
 from .security import APISecurity
 from .services import APIServices
+from .sockets import SocketRegistry
 from .store import APIStore
 from .supervisor import APISupervisor
+from .time import APITime
 from .utils import api_process, api_process_raw
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 MAX_CLIENT_SIZE: int = 1024**2 * 16
+# Backoff for retrying Core's socket, the s6 watchdog bounds the total time
+CORE_SOCKET_RETRY_MIN: int = 1
+CORE_SOCKET_RETRY_MAX: int = 60
 MAX_LINE_SIZE: int = 24570
 
 
@@ -67,7 +83,7 @@ class RestAPI(CoreSysAttributes):
     def __init__(self, coresys: CoreSys):
         """Initialize Docker base wrapper."""
         self.coresys: CoreSys = coresys
-        self.security: SecurityMiddleware = SecurityMiddleware(coresys)
+        self.security: SecurityMiddleware = SecurityMiddleware(coresys, self)
         self.webapp: web.Application = web.Application(
             client_max_size=MAX_CLIENT_SIZE,
             middlewares=[
@@ -87,6 +103,8 @@ class RestAPI(CoreSysAttributes):
         # service stuff
         self._runner: web.AppRunner = web.AppRunner(self.webapp, shutdown_timeout=5)
         self._site: web.TCPSite | None = None
+        self.sockets: SocketRegistry = SocketRegistry(coresys, self._runner)
+        self._core_socket_retry: asyncio.Task | None = None
 
         # share single host API handler for reuse in logging endpoints
         self._api_host: APIHost = APIHost()
@@ -105,6 +123,8 @@ class RestAPI(CoreSysAttributes):
 
     async def load(self) -> None:
         """Register REST API Calls."""
+        self.webapp[WEBSOCKETS] = weakref.WeakSet()
+        self.webapp.on_shutdown.append(self._close_websockets)
         v2_enabled = self.sys_config.feature_flags.get(
             FeatureFlag.SUPERVISOR_V2_API, False
         )
@@ -143,6 +163,7 @@ class RestAPI(CoreSysAttributes):
             self._register_services(app)
             self._register_store(app)
             self._register_supervisor(app)
+            self._register_time(app)
 
         if static_resource_configs:
 
@@ -167,7 +188,7 @@ class RestAPI(CoreSysAttributes):
         path: str,
         syslog_identifier: str,
         app: web.Application,
-        default_verbose: bool = False,
+        default_format: LogFormatter = LogFormatter.PLAIN,
     ) -> None:
         """Register logs endpoint for a given path, returning logs for single syslog identifier."""
         app.add_routes(
@@ -177,7 +198,7 @@ class RestAPI(CoreSysAttributes):
                     partial(
                         self._api_host.advanced_logs,
                         identifier=syslog_identifier,
-                        default_verbose=default_verbose,
+                        default_format=default_format,
                     ),
                 ),
                 web.get(
@@ -186,7 +207,7 @@ class RestAPI(CoreSysAttributes):
                         self._api_host.advanced_logs,
                         identifier=syslog_identifier,
                         follow=True,
-                        default_verbose=default_verbose,
+                        default_format=default_format,
                     ),
                 ),
                 web.get(
@@ -196,7 +217,7 @@ class RestAPI(CoreSysAttributes):
                         identifier=syslog_identifier,
                         latest=True,
                         no_colors=True,
-                        default_verbose=default_verbose,
+                        default_format=default_format,
                     ),
                 ),
                 web.get(
@@ -204,7 +225,7 @@ class RestAPI(CoreSysAttributes):
                     partial(
                         self._api_host.advanced_logs,
                         identifier=syslog_identifier,
-                        default_verbose=default_verbose,
+                        default_format=default_format,
                     ),
                 ),
                 web.get(
@@ -213,7 +234,7 @@ class RestAPI(CoreSysAttributes):
                         self._api_host.advanced_logs,
                         identifier=syslog_identifier,
                         follow=True,
-                        default_verbose=default_verbose,
+                        default_format=default_format,
                     ),
                 ),
             ]
@@ -225,14 +246,25 @@ class RestAPI(CoreSysAttributes):
 
         app.add_routes(
             [
-                web.get("/host/info", api_host.info),
+                web.get(
+                    "/host/info",
+                    api_host.info_v1
+                    if app is self.versions[AppVersion.V1]
+                    else api_host.info,
+                ),
                 web.get(
                     "/host/logs",
-                    partial(api_host.advanced_logs, default_verbose=True),
+                    partial(
+                        api_host.advanced_logs, default_format=LogFormatter.VERBOSE
+                    ),
                 ),
                 web.get(
                     "/host/logs/follow",
-                    partial(api_host.advanced_logs, follow=True, default_verbose=True),
+                    partial(
+                        api_host.advanced_logs,
+                        follow=True,
+                        default_format=LogFormatter.VERBOSE,
+                    ),
                 ),
                 web.get("/host/logs/identifiers", api_host.list_identifiers),
                 web.get("/host/logs/identifiers/{identifier}", api_host.advanced_logs),
@@ -243,11 +275,17 @@ class RestAPI(CoreSysAttributes):
                 web.get("/host/logs/boots", api_host.list_boots),
                 web.get(
                     "/host/logs/boots/{bootid}",
-                    partial(api_host.advanced_logs, default_verbose=True),
+                    partial(
+                        api_host.advanced_logs, default_format=LogFormatter.VERBOSE
+                    ),
                 ),
                 web.get(
                     "/host/logs/boots/{bootid}/follow",
-                    partial(api_host.advanced_logs, follow=True, default_verbose=True),
+                    partial(
+                        api_host.advanced_logs,
+                        follow=True,
+                        default_format=LogFormatter.VERBOSE,
+                    ),
                 ),
                 web.get(
                     "/host/logs/boots/{bootid}/identifiers/{identifier}",
@@ -262,8 +300,9 @@ class RestAPI(CoreSysAttributes):
                 web.post("/host/reload", api_host.reload),
                 web.post("/host/options", api_host.options),
                 web.get("/host/services", api_host.services),
+                web.get("/host/disks", api_host.disks),
                 web.get(
-                    "/host/disks/default/usage",
+                    "/host/disks/{disk}/usage",
                     api_host.disk_usage_v1
                     if app is self.versions[AppVersion.V1]
                     else api_host.disk_usage,
@@ -276,25 +315,56 @@ class RestAPI(CoreSysAttributes):
         api_network = APINetwork()
         api_network.coresys = self.coresys
 
+        if app is self.versions[AppVersion.V1]:
+            app.add_routes(
+                [
+                    web.get("/network/info", api_network.info_v1),
+                    web.post("/network/reload", api_network.reload),
+                    web.get(
+                        "/network/interface/{interface}/info",
+                        api_network.interface_info_v1,
+                    ),
+                    web.post(
+                        "/network/interface/{interface}/update",
+                        api_network.interface_update,
+                    ),
+                    web.get(
+                        "/network/interface/{interface}/accesspoints",
+                        api_network.scan_accesspoints,
+                    ),
+                    web.post(
+                        "/network/interface/{interface}/vlan/{vlan}",
+                        api_network.create_vlan,
+                    ),
+                ]
+            )
+
+        if app is self.versions[AppVersion.V2]:
+            app.add_routes(
+                [
+                    web.get("/network/info", api_network.info),
+                    web.post("/network/reload", api_network.reload),
+                    web.get("/network/interfaces/{name}", api_network.interface_info),
+                    web.put(
+                        "/network/interfaces/{name}/config",
+                        api_network.update_config,
+                    ),
+                    web.get(
+                        "/network/interfaces/{interface}/accesspoints",
+                        api_network.scan_accesspoints,
+                    ),
+                ]
+            )
+
+    def _register_time(self, app: web.Application) -> None:
+        """Register time and date functions."""
+        api_time = APITime()
+        api_time.coresys = self.coresys
+
         app.add_routes(
             [
-                web.get("/network/info", api_network.info),
-                web.post("/network/reload", api_network.reload),
-                web.get(
-                    "/network/interface/{interface}/info", api_network.interface_info
-                ),
-                web.post(
-                    "/network/interface/{interface}/update",
-                    api_network.interface_update,
-                ),
-                web.get(
-                    "/network/interface/{interface}/accesspoints",
-                    api_network.scan_accesspoints,
-                ),
-                web.post(
-                    "/network/interface/{interface}/vlan/{vlan}",
-                    api_network.create_vlan,
-                ),
+                web.get("/time/info", api_time.info),
+                web.post("/time/options", api_time.options),
             ]
         )
 
@@ -314,6 +384,9 @@ class RestAPI(CoreSysAttributes):
                 web.get("/os/datadisk/list", api_os.list_data),
                 web.post("/os/datadisk/wipe", api_os.wipe_data),
                 web.post("/os/boot-slot", api_os.set_boot_slot),
+                web.get("/os/ssh/authorized_keys", api_os.ssh_authorized_keys_list),
+                web.post("/os/ssh/authorized_keys", api_os.ssh_authorized_keys_add),
+                web.delete("/os/ssh/authorized_keys", api_os.ssh_authorized_keys_clear),
             ]
         )
 
@@ -369,10 +442,13 @@ class RestAPI(CoreSysAttributes):
         api_cli = APICli()
         api_cli.coresys = self.coresys
 
+        stats_handler = (
+            api_cli.stats_v1 if app is self.versions[AppVersion.V1] else api_cli.stats
+        )
         app.add_routes(
             [
                 web.get("/cli/info", api_cli.info),
-                web.get("/cli/stats", api_cli.stats),
+                web.get("/cli/stats", stats_handler),
                 web.post("/cli/update", api_cli.update),
             ]
         )
@@ -382,10 +458,15 @@ class RestAPI(CoreSysAttributes):
         api_observer = APIObserver()
         api_observer.coresys = self.coresys
 
+        stats_handler = (
+            api_observer.stats_v1
+            if app is self.versions[AppVersion.V1]
+            else api_observer.stats
+        )
         app.add_routes(
             [
                 web.get("/observer/info", api_observer.info),
-                web.get("/observer/stats", api_observer.stats),
+                web.get("/observer/stats", stats_handler),
                 web.post("/observer/update", api_observer.update),
             ]
         )
@@ -395,16 +476,25 @@ class RestAPI(CoreSysAttributes):
         api_multicast = APIMulticast()
         api_multicast.coresys = self.coresys
 
+        stats_handler = (
+            api_multicast.stats_v1
+            if app is self.versions[AppVersion.V1]
+            else api_multicast.stats
+        )
         app.add_routes(
             [
                 web.get("/multicast/info", api_multicast.info),
-                web.get("/multicast/stats", api_multicast.stats),
+                web.get("/multicast/stats", stats_handler),
+                web.post("/multicast/options", api_multicast.options),
                 web.post("/multicast/update", api_multicast.update),
                 web.post("/multicast/restart", api_multicast.restart),
             ]
         )
         self._register_advanced_logs(
-            "/multicast", "hassio_multicast", default_verbose=True, app=app
+            "/multicast",
+            "hassio_multicast",
+            default_format=LogFormatter.VERBOSE,
+            app=app,
         )
 
     def _register_hardware(self, app: web.Application) -> None:
@@ -453,6 +543,10 @@ class RestAPI(CoreSysAttributes):
                     web.post(
                         "/resolution/check/{check}/run", api_resolution.run_check_v1
                     ),
+                    web.get(
+                        "/resolution/issue/{issue}/suggestions",
+                        api_resolution.suggestions_for_issue_v1,
+                    ),
                 ]
             )
         else:
@@ -464,6 +558,10 @@ class RestAPI(CoreSysAttributes):
                         api_resolution.options_check,
                     ),
                     web.post("/resolution/check/{check}/run", api_resolution.run_check),
+                    web.get(
+                        "/resolution/issue/{issue}/suggestions",
+                        api_resolution.suggestions_for_issue,
+                    ),
                 ]
             )
 
@@ -480,10 +578,6 @@ class RestAPI(CoreSysAttributes):
                 web.delete(
                     "/resolution/issue/{issue}",
                     api_resolution.dismiss_issue,
-                ),
-                web.get(
-                    "/resolution/issue/{issue}/suggestions",
-                    api_resolution.suggestions_for_issue,
                 ),
                 web.post("/resolution/healthcheck", api_resolution.healthcheck),
             ]
@@ -509,15 +603,31 @@ class RestAPI(CoreSysAttributes):
         api_supervisor = APISupervisor()
         api_supervisor.coresys = self.coresys
 
+        info_handler = (
+            api_supervisor.info_v1
+            if app is self.versions[AppVersion.V1]
+            else api_supervisor.info
+        )
+        options_handler = (
+            api_supervisor.options_v1
+            if app is self.versions[AppVersion.V1]
+            else api_supervisor.options
+        )
+        stats_handler = (
+            api_supervisor.stats_v1
+            if app is self.versions[AppVersion.V1]
+            else api_supervisor.stats
+        )
+
         app.add_routes(
             [
                 web.get("/supervisor/ping", api_supervisor.ping),
-                web.get("/supervisor/info", api_supervisor.info),
-                web.get("/supervisor/stats", api_supervisor.stats),
+                web.get("/supervisor/info", info_handler),
+                web.get("/supervisor/stats", stats_handler),
                 web.post("/supervisor/update", api_supervisor.update),
                 web.post("/supervisor/reload", api_supervisor.reload),
                 web.post("/supervisor/restart", api_supervisor.restart),
-                web.post("/supervisor/options", api_supervisor.options),
+                web.post("/supervisor/options", options_handler),
                 web.post("/supervisor/repair", api_supervisor.repair),
             ]
         )
@@ -573,10 +683,13 @@ class RestAPI(CoreSysAttributes):
         api_hass = APIHomeAssistant()
         api_hass.coresys = self.coresys
 
+        stats_handler = (
+            api_hass.stats_v1 if app is self.versions[AppVersion.V1] else api_hass.stats
+        )
         app.add_routes(
             [
                 web.get("/core/info", api_hass.info),
-                web.get("/core/stats", api_hass.stats),
+                web.get("/core/stats", stats_handler),
                 web.post("/core/options", api_hass.options),
                 web.post("/core/update", api_hass.update),
                 web.post("/core/restart", api_hass.restart),
@@ -594,7 +707,7 @@ class RestAPI(CoreSysAttributes):
             self.versions[AppVersion.V1].add_routes(
                 [
                     web.get("/homeassistant/info", api_hass.info),
-                    web.get("/homeassistant/stats", api_hass.stats),
+                    web.get("/homeassistant/stats", api_hass.stats_v1),
                     web.post("/homeassistant/options", api_hass.options),
                     web.post("/homeassistant/restart", api_hass.restart),
                     web.post("/homeassistant/stop", api_hass.stop),
@@ -653,6 +766,7 @@ class RestAPI(CoreSysAttributes):
                     f"addon_{app_obj.slug}",
                     f"app_{app_obj.slug}",
                 ]
+                kwargs["default_format"] = app_obj.log_format
                 return await self._api_host.advanced_logs(request, *args, **kwargs)
 
             # Legacy routing to support requests for not installed apps
@@ -664,7 +778,7 @@ class RestAPI(CoreSysAttributes):
                 """Route to store if info requested for not installed app."""
                 try:
                     addon: App = api_apps.get_app_for_request(request)
-                    return await api_apps.info_data(addon, request)
+                    return await api_apps.info_data_v1(addon, request)
                 except APIAppNotInstalled:
                     # Route to store/{app}/info but add missing fields
                     return dict(
@@ -690,7 +804,7 @@ class RestAPI(CoreSysAttributes):
                     web.post("/addons/{app}/rebuild", api_apps.rebuild),
                     web.post("/addons/{app}/stdin", api_apps.stdin),
                     web.post("/addons/{app}/security", api_apps.security),
-                    web.get("/addons/{app}/stats", api_apps.stats),
+                    web.get("/addons/{app}/stats", api_apps.stats_v1),
                     web.get("/addons/{app}/logs", get_app_logs),
                     web.get(
                         "/addons/{app}/logs/follow",
@@ -717,6 +831,7 @@ class RestAPI(CoreSysAttributes):
                     f"addon_{app_obj.slug}",
                     f"app_{app_obj.slug}",
                 ]
+                kwargs["default_format"] = app_obj.log_format
                 return await self._api_host.advanced_logs(request, *args, **kwargs)
 
             app.add_routes(
@@ -872,10 +987,13 @@ class RestAPI(CoreSysAttributes):
         api_dns = APICoreDNS()
         api_dns.coresys = self.coresys
 
+        stats_handler = (
+            api_dns.stats_v1 if app is self.versions[AppVersion.V1] else api_dns.stats
+        )
         app.add_routes(
             [
                 web.get("/dns/info", api_dns.info),
-                web.get("/dns/stats", api_dns.stats),
+                web.get("/dns/stats", stats_handler),
                 web.post("/dns/update", api_dns.update),
                 web.post("/dns/options", api_dns.options),
                 web.post("/dns/restart", api_dns.restart),
@@ -884,7 +1002,7 @@ class RestAPI(CoreSysAttributes):
         )
 
         self._register_advanced_logs(
-            "/dns", "hassio_dns", default_verbose=True, app=app
+            "/dns", "hassio_dns", default_format=LogFormatter.VERBOSE, app=app
         )
 
     def _register_audio(self, app: web.Application) -> None:
@@ -892,10 +1010,15 @@ class RestAPI(CoreSysAttributes):
         api_audio = APIAudio()
         api_audio.coresys = self.coresys
 
+        stats_handler = (
+            api_audio.stats_v1
+            if app is self.versions[AppVersion.V1]
+            else api_audio.stats
+        )
         app.add_routes(
             [
                 web.get("/audio/info", api_audio.info),
-                web.get("/audio/stats", api_audio.stats),
+                web.get("/audio/stats", stats_handler),
                 web.post("/audio/update", api_audio.update),
                 web.post("/audio/restart", api_audio.restart),
                 web.post("/audio/reload", api_audio.reload),
@@ -909,7 +1032,7 @@ class RestAPI(CoreSysAttributes):
         )
 
         self._register_advanced_logs(
-            "/audio", "hassio_audio", default_verbose=True, app=app
+            "/audio", "hassio_audio", default_format=LogFormatter.VERBOSE, app=app
         )
 
     def _register_mounts(self, app: web.Application) -> None:
@@ -1056,6 +1179,7 @@ class RestAPI(CoreSysAttributes):
                 web.get("/docker/registries", api_docker.registries),
                 web.post("/docker/registries", api_docker.create_registry),
                 web.delete("/docker/registries/{hostname}", api_docker.remove_registry),
+                web.post("/docker/reset-storage", api_docker.reset_storage),
             ]
         )
 
@@ -1063,13 +1187,47 @@ class RestAPI(CoreSysAttributes):
         """Run RESTful API webserver."""
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, host="0.0.0.0", port=80)
+        listening: list[str] = []
 
         try:
             await self._site.start()
         except OSError as err:
             _LOGGER.critical("Failed to create HTTP server at 0.0.0.0:80 -> %s", err)
         else:
-            _LOGGER.info("Starting API on %s", self.sys_docker.network.supervisor)
+            listening.append(str(self.sys_docker.network.supervisor))
+
+        if not await self._listen_for_core():
+            self._core_socket_retry = self.sys_create_background_task(
+                self._retry_listen_for_core()
+            )
+        listening.extend(self.sockets.paths)
+
+        if listening:
+            _LOGGER.info("Starting API on %s", ", ".join(listening))
+
+    async def _listen_for_core(self) -> bool:
+        """Listen for Core on its socket, return whether it worked."""
+        try:
+            await self.sockets.register(
+                self.sys_homeassistant,
+                self.sys_homeassistant.path_run_supervisor / SOCKET_NAME_SUPERVISOR,
+            )
+        except APISocketError as err:
+            _LOGGER.error("Failed to create API socket for Core -> %s", err)
+            return False
+        return True
+
+    async def _retry_listen_for_core(self) -> None:
+        """Retry listening for Core on its socket until it works."""
+        # Serving Core defines a working Supervisor, so never give up
+        delay = CORE_SOCKET_RETRY_MIN
+        while True:
+            _LOGGER.info("Retrying API socket for Core in %d seconds", delay)
+            await asyncio.sleep(delay)
+            if await self._listen_for_core():
+                _LOGGER.info("Starting API on %s", ", ".join(self.sockets.paths))
+                return
+            delay = min(delay * 2, CORE_SOCKET_RETRY_MAX)
 
     async def stop(self) -> None:
         """Stop RESTful API webserver."""
@@ -1077,7 +1235,41 @@ class RestAPI(CoreSysAttributes):
             return
 
         # Shutdown running API
+        if self._core_socket_retry:
+            self._core_socket_retry.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._core_socket_retry
         await self._site.stop()
+        await self.sockets.stop_all()
         await self._runner.cleanup()
 
         _LOGGER.info("Stopping API on %s", self.sys_docker.network.supervisor)
+
+    async def _close_websockets(self, app: web.Application) -> None:
+        """Close open proxied websockets on app shutdown.
+
+        aiohttp's graceful shutdown only waits for in-flight handlers, so
+        long-lived websocket proxies would otherwise hold the API stop until
+        the shutdown timeout expires.
+        """
+        # Closed sockets linger in the weak set until garbage collected
+        websockets = [
+            websocket for websocket in app[WEBSOCKETS] if not websocket.closed
+        ]
+        if not websockets:
+            return
+
+        _LOGGER.info("Closing %d websocket connections", len(websockets))
+        try:
+            async with asyncio.timeout(WEBSOCKET_CLOSE_TIMEOUT):
+                await asyncio.gather(
+                    *(
+                        websocket.close(
+                            code=WSCloseCode.GOING_AWAY, message=b"Supervisor stopping"
+                        )
+                        for websocket in websockets
+                    ),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            _LOGGER.warning("Timeout closing websocket connections")

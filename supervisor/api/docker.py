@@ -12,7 +12,6 @@ from ..const import (
     ATTR_HOSTNAME,
     ATTR_LOGGING,
     ATTR_MTU,
-    ATTR_PASSWORD,
     ATTR_REGISTRIES,
     ATTR_STORAGE,
     ATTR_STORAGE_DRIVER,
@@ -20,20 +19,14 @@ from ..const import (
     ATTR_VERSION,
 )
 from ..coresys import CoreSysAttributes
-from ..exceptions import APINotFound
+from ..exceptions import APIError, APINotFound, DBusError
 from ..resolution.const import ContextType, IssueType, SuggestionType
+from ..validate import SCHEMA_DOCKER_REGISTRY
 from .utils import api_process, api_validate
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-SCHEMA_DOCKER_REGISTRY = vol.Schema(
-    {
-        str: {
-            vol.Required(ATTR_USERNAME): str,
-            vol.Required(ATTR_PASSWORD): str,
-        }
-    }
-)
+HAOS_DOCKER_STORAGE_RESET_MIN_VERSION = AwesomeVersion("18.3.dev20260826")
 
 # pylint: disable=no-value-for-parameter
 SCHEMA_OPTIONS = vol.Schema(
@@ -114,7 +107,11 @@ class APIDocker(CoreSysAttributes):
     @api_process
     async def create_registry(self, request: web.Request) -> None:
         """Create a new docker registry."""
-        body = await api_validate(SCHEMA_DOCKER_REGISTRY, request)
+        body = await api_validate(
+            SCHEMA_DOCKER_REGISTRY,
+            request,
+            redact_values=True,
+        )
 
         for hostname, registry in body.items():
             self.sys_docker.config.registries[hostname] = registry
@@ -149,6 +146,37 @@ class APIDocker(CoreSysAttributes):
         )
 
         _LOGGER.info("Host system reboot required to apply Docker storage migration")
+        self.sys_resolution.create_issue(
+            IssueType.REBOOT_REQUIRED,
+            ContextType.SYSTEM,
+            suggestions=[SuggestionType.EXECUTE_REBOOT],
+        )
+
+    @api_process
+    async def reset_storage(self, request: web.Request) -> None:
+        """Schedule a Docker storage reset on next reboot."""
+        if (
+            not self.coresys.os.available
+            or not self.coresys.os.version
+            or self.coresys.os.version < HAOS_DOCKER_STORAGE_RESET_MIN_VERSION
+        ):
+            raise APINotFound(
+                "Home Assistant OS 18.3 or newer required for Docker storage reset"
+            )
+
+        _LOGGER.info("Scheduling reset of Docker storage on next reboot")
+        try:
+            if not await self.sys_dbus.agent.system.schedule_docker_storage_reset():
+                raise APIError(
+                    "Can't schedule Docker storage reset, check host logs for details",
+                    _LOGGER.error,
+                )
+        except DBusError as err:
+            raise APIError(
+                f"Can't schedule Docker storage reset: {err!s}", _LOGGER.error
+            ) from err
+
+        _LOGGER.info("Host system reboot required to apply Docker storage reset")
         self.sys_resolution.create_issue(
             IssueType.REBOOT_REQUIRED,
             ContextType.SYSTEM,

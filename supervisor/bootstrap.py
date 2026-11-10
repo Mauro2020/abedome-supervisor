@@ -3,6 +3,8 @@
 # ruff: noqa: T100
 import asyncio
 from collections.abc import Callable
+from contextlib import suppress
+from datetime import UTC, datetime
 import logging
 import os
 import signal
@@ -112,8 +114,7 @@ async def initialize_coresys() -> CoreSys:
     if coresys.dev:
         coresys.updater.channel = UpdateChannel.DEV
 
-    # Convert datetime
-    logging.Formatter.converter = lambda *args: coresys.now().timetuple()
+    SupervisorLogFormatter.coresys = coresys
 
     return coresys
 
@@ -154,6 +155,21 @@ def _migrate_legacy_paths(coresys: CoreSys) -> None:
             "Legacy addons directory '%s' not empty, leaving in place",
             legacy_addons.as_posix(),
         )
+
+    # Same for the emergency folder of the eager-mount design, including the
+    # empty mount points it holds.
+    emergency = supervisor / "emergency"
+    if emergency.is_dir():
+        for leftover in emergency.iterdir():
+            with suppress(OSError):
+                leftover.rmdir()
+        try:
+            emergency.rmdir()
+        except OSError:
+            _LOGGER.debug(
+                "Emergency directory '%s' not empty, leaving in place",
+                emergency.as_posix(),
+            )
 
 
 def initialize_system(coresys: CoreSys) -> None:
@@ -255,12 +271,12 @@ def initialize_system(coresys: CoreSys) -> None:
         )
         config.path_mounts_credentials.mkdir(mode=0o600)
 
-    # Emergency folder
-    if not config.path_emergency.is_dir():
+    if not config.path_mounts_devices.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor emergency folder at '%s'", config.path_emergency
+            "Creating Supervisor mounts devices folder at '%s'",
+            config.path_mounts_devices,
         )
-        config.path_emergency.mkdir()
+        config.path_mounts_devices.mkdir()
 
     # App Configs folder
     if not config.path_app_configs.is_dir():
@@ -287,22 +303,33 @@ def warning_handler(message, category, filename, lineno, file=None, line=None):
         capture_exception(message)
 
 
+class SupervisorLogFormatter(ColoredFormatter):
+    """Colored formatter with milliseconds and the UTC offset in timestamps."""
+
+    coresys: CoreSys | None = None
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        """Format the record timestamp as `YYYY-MM-DD HH:MM:SS.mmm+HH:MM`."""
+        tz = self.coresys.timezone_tzinfo if self.coresys else None
+        return (
+            datetime.fromtimestamp(record.created, UTC)
+            .astimezone(tz)
+            .isoformat(sep=" ", timespec="milliseconds")
+        )
+
+
 def initialize_logging() -> None:
     """Initialize the logging."""
     logging.basicConfig(level=logging.INFO)
-    fmt = (
-        "%(asctime)s.%(msecs)03d %(levelname)s (%(threadName)s) [%(name)s] %(message)s"
-    )
+    fmt = "%(asctime)s %(levelname)s (%(threadName)s) [%(name)s] %(message)s"
     colorfmt = f"%(log_color)s{fmt}%(reset)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
 
     # suppress overly verbose logs from libraries that aren't helpful
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
     logging.getLogger().handlers[0].setFormatter(
-        ColoredFormatter(
+        SupervisorLogFormatter(
             colorfmt,
-            datefmt=datefmt,
             reset=True,
             log_colors={
                 "DEBUG": "cyan",

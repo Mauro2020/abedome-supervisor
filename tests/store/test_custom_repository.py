@@ -6,11 +6,13 @@ from unittest.mock import PropertyMock, patch
 import pytest
 
 from supervisor.apps.app import App
+from supervisor.const import URL_HASSIO_APPS, URL_HASSIO_APPS_LEGACY
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import (
     StoreError,
     StoreGitCloneError,
     StoreGitError,
+    StoreGitRemoteURLUpdateError,
     StoreJobError,
     StoreNotFound,
 )
@@ -164,6 +166,23 @@ async def test_add_repository_with_git_error(
     assert coresys.resolution.suggestions[-1].type == suggestion_type
 
 
+async def test_add_repository_with_remote_url_update_error_on_startup(
+    coresys: CoreSys, store_manager: StoreManager
+):
+    """Test startup path ignores remote URL update errors."""
+    current = coresys.store.repository_urls
+    with patch(
+        "supervisor.store.git.GitRepo.load",
+        side_effect=StoreGitRemoteURLUpdateError(),
+    ):
+        await store_manager.update_repositories(
+            set(current) | {"http://example.com"}, issue_on_error=True
+        )
+
+    assert "http://example.com" in coresys.store.repository_urls
+    assert len(coresys.resolution.suggestions) == 0
+
+
 @pytest.mark.parametrize(
     ("use_update", "git_error"),
     [
@@ -171,6 +190,7 @@ async def test_add_repository_with_git_error(
         (True, StoreGitError()),
         (False, StoreGitCloneError()),
         (False, StoreGitError()),
+        (False, StoreGitRemoteURLUpdateError()),
     ],
 )
 async def test_error_on_repository_with_git_error(
@@ -302,6 +322,29 @@ async def test_error_adding_duplicate(
         pytest.raises(StoreError),
     ):
         await store_manager.add_repository(test_repository.source)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param(URL_HASSIO_APPS, id="current"),
+        pytest.param(URL_HASSIO_APPS_LEGACY, id="legacy"),
+    ],
+)
+async def test_add_core_repository_url(store_manager: StoreManager, url: str):
+    """Test adding the core repository by URL resolves to the core repository."""
+    with (
+        patch("supervisor.store.git.GitRepo.load", return_value=None),
+        patch(
+            "supervisor.utils.common.read_yaml_file",
+            return_value={"name": "Official apps"},
+        ),
+        patch("pathlib.Path.exists", return_value=True),
+    ):
+        await store_manager.add_repository(url)
+
+    assert BuiltinRepository.CORE.value in store_manager.repositories
+    assert url not in store_manager.repositories
 
 
 async def test_add_with_update_repositories(

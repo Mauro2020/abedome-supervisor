@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import PurePath
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 import aiodocker
 from aiodocker.containers import DockerContainer
@@ -14,17 +14,29 @@ import pytest
 from supervisor.apps.app import App
 from supervisor.apps.build import AppBuild
 from supervisor.arch import CpuArchManager
-from supervisor.const import AppState, CpuArch
+from supervisor.const import AppState, CoreState, CpuArch
 from supervisor.coresys import CoreSys
 from supervisor.docker.app import DockerApp
 from supervisor.docker.const import ContainerState
-from supervisor.docker.manager import CommandReturn
+from supervisor.docker.manager import CommandReturn, DockerAPI
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import HassioError
+from supervisor.host.const import LogFormatter
 from supervisor.store.repository import Repository
 
-from ..common import force_app_state
+from ..common import force_app_state, load_json_fixture
 from ..const import TEST_ADDON_SLUG
+
+
+@pytest.fixture(autouse=True)
+async def running_state(coresys: CoreSys) -> None:
+    """Set the default state to a fully started system.
+
+    Starting/restarting/rebuilding an app via the API is only allowed once
+    Supervisor has fully started (see require_running_system). Tests
+    exercising other states set them explicitly.
+    """
+    await coresys.core.set_state(CoreState.RUNNING)
 
 
 def _create_test_event(name: str, state: ContainerState) -> DockerContainerStateEvent:
@@ -55,6 +67,7 @@ async def test_apps_info(
     assert result["data"]["ingress_panel"] is True
     assert result["data"]["protected"] is True
     assert result["data"]["watchdog"] is False
+    assert result["data"]["log_format"] == "plain"
 
 
 @pytest.mark.parametrize("api_client", ["local_example"], indirect=True)
@@ -125,14 +138,29 @@ async def test_apps_info_not_installed(
     }
 
 
-@pytest.mark.usefixtures("install_app_ssh")
+@pytest.mark.parametrize(
+    ("config", "formatter"),
+    [
+        pytest.param({}, LogFormatter.PLAIN, id="default"),
+        pytest.param({"log_format": "plain"}, LogFormatter.PLAIN, id="plain"),
+        pytest.param(
+            {"log_format": "timestamp"}, LogFormatter.TIMESTAMP, id="timestamp"
+        ),
+        pytest.param({"log_format": "verbose"}, LogFormatter.VERBOSE, id="verbose"),
+    ],
+)
 async def test_api_app_logs(
-    advanced_logs_tester: Callable[[str, str | list[str]], Awaitable[None]],
+    advanced_logs_tester: Callable[..., Awaitable[None]],
+    install_app_ssh: App,
+    config: dict[str, str],
+    formatter: LogFormatter,
 ):
     """Test app logs."""
+    install_app_ssh.data.update(config)
     await advanced_logs_tester(
         "/addons/local_ssh",
         ["addon_local_ssh", "app_local_ssh"],
+        formatter,
         v2_path_prefix="/apps/local_ssh",
     )
 
@@ -635,6 +663,33 @@ async def test_app_set_options(
     assert install_app_example.options == {"message": "test"}
 
 
+async def test_app_set_options_keeps_secret_refs(
+    app_api_client_with_root: tuple[TestClient, str],
+    install_app_example: App,
+    coresys: CoreSys,
+):
+    """Test !secret references persist as references, not resolved values."""
+    client, root = app_api_client_with_root
+    coresys.homeassistant.secrets.secrets = {"example_secret": "hunter2"}
+    install_app_example.data["schema"] = {
+        "message": "str?",
+        "credentials": {"username": "str", "password": "str"},
+        "servers": [{"host": "str", "token": "str"}],
+    }
+
+    options = {
+        "message": "!secret example_secret",
+        "credentials": {"username": "alice", "password": "!secret example_secret"},
+        "servers": [
+            {"host": "server1", "token": "!secret example_secret"},
+            {"host": "server2", "token": "plain-token"},
+        ],
+    }
+    resp = await client.post(f"{root}/local_example/options", json={"options": options})
+    assert resp.status == 200
+    assert install_app_example.options == options
+
+
 async def test_app_reset_options(
     app_api_client_with_root: tuple[TestClient, str], install_app_example: App
 ):
@@ -720,19 +775,67 @@ async def test_app_start_options_error(
 
 @pytest.mark.parametrize(("method", "action"), [("get", "stats"), ("post", "stdin")])
 @pytest.mark.usefixtures("install_app_example")
-async def test_app_not_running_error(
-    app_api_client_with_root: tuple[TestClient, str], method: str, action: str
-):
-    """Test app not running error for endpoints that require that."""
-    client, root = app_api_client_with_root
+async def test_app_not_running_error(api_client: TestClient, method: str, action: str):
+    """Test app not running error for endpoints that require that.
+
+    v2 stats always uses one-shot mode, which doesn't check whether the
+    container is running (see test_app_stats_v2_one_shot_ignores_not_running),
+    so this only covers v1 for the "stats" action.
+    """
     with patch.object(App, "with_stdin", new=PropertyMock(return_value=True)):
-        resp = await client.request(method, f"{root}/local_example/{action}")
+        resp = await api_client.request(method, f"/addons/local_example/{action}")
 
     assert resp.status == 400
     body = await resp.json()
     assert body["message"] == "App local_example is not running"
     assert body["error_key"] == "app_not_running_error"
     assert body["extra_fields"] == {"app": "local_example"}
+
+
+@pytest.mark.usefixtures("install_app_example")
+async def test_app_not_running_error_stdin_v2(api_client_v2: TestClient):
+    """Test app not running error for stdin on v2."""
+    with patch.object(App, "with_stdin", new=PropertyMock(return_value=True)):
+        resp = await api_client_v2.post("/v2/apps/local_example/stdin")
+
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["message"] == "App local_example is not running"
+    assert body["error_key"] == "app_not_running_error"
+    assert body["extra_fields"] == {"app": "local_example"}
+
+
+@pytest.mark.usefixtures("install_app_example")
+async def test_app_stats_v2_one_shot_ignores_not_running(api_client_v2: TestClient):
+    """Test v2 app stats always uses one-shot mode, which doesn't require the container to be running."""
+    stats_fixture = load_json_fixture("container_stats.json")
+    del stats_fixture["precpu_stats"]
+
+    with patch.object(
+        DockerAPI, "_query_one_shot_stats", AsyncMock(return_value=stats_fixture)
+    ):
+        resp = await api_client_v2.get("/v2/apps/local_example/stats")
+
+    assert resp.status == 200
+    result = await resp.json()
+    assert "cpu_percent" not in result["data"]
+    assert result["data"]["cpu_usage"] == 190
+
+
+@pytest.mark.usefixtures("install_app_example")
+async def test_app_stats_v1(api_client: TestClient, container: DockerContainer):
+    """Test v1 app stats returns a windowed sample including cpu_percent."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.stats = AsyncMock(
+        return_value=[load_json_fixture("container_stats.json")]
+    )
+
+    resp = await api_client.get("/addons/local_example/stats")
+
+    assert resp.status == 200
+    result = await resp.json()
+    assert result["data"]["cpu_percent"] == 90.0
+    assert result["data"]["memory_usage"] == 59700000
 
 
 @pytest.mark.usefixtures("install_app_example")
@@ -793,3 +896,81 @@ async def test_v2_list_apps_uses_apps_key(api_client_v2: TestClient):
     assert "apps" in body["data"]
     assert "addons" not in body["data"]
     assert body["data"]["apps"][0]["slug"] == "local_ssh"
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_v1_list_apps_includes_deprecated_advanced(api_client: TestClient):
+    """V1 GET /addons keeps deprecated advanced field."""
+    resp = await api_client.get("/addons")
+    assert resp.status == 200
+
+    body = await resp.json()
+    assert "advanced" in body["data"]["addons"][0]
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_v2_list_apps_excludes_deprecated_advanced(api_client_v2: TestClient):
+    """V2 GET /v2/apps drops deprecated advanced field."""
+    resp = await api_client_v2.get("/v2/apps")
+    assert resp.status == 200
+
+    body = await resp.json()
+    assert "advanced" not in body["data"]["apps"][0]
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_apps_info_versioned_advanced_field(
+    app_api_client_with_root: tuple[TestClient, str],
+):
+    """V1 app info keeps advanced, v2 app info drops it."""
+    client, root = app_api_client_with_root
+
+    resp = await client.get(f"{root}/{TEST_ADDON_SLUG}/info")
+    assert resp.status == 200
+
+    data = (await resp.json())["data"]
+    if root == "/addons":
+        assert "advanced" in data
+    else:
+        assert "advanced" not in data
+
+
+@pytest.mark.usefixtures("os_available", "journald_logs")
+@pytest.mark.parametrize(
+    ("query", "accept", "formatter"),
+    [
+        pytest.param("format=plain", "text/plain", LogFormatter.PLAIN, id="plain"),
+        pytest.param(
+            "format=verbose", "text/plain", LogFormatter.VERBOSE, id="verbose"
+        ),
+        pytest.param(
+            "verbose", "text/plain", LogFormatter.VERBOSE, id="legacy-verbose"
+        ),
+        pytest.param("", "text/x-log", LogFormatter.VERBOSE, id="legacy-accept"),
+        pytest.param(
+            "format=plain&verbose",
+            "text/x-log",
+            LogFormatter.PLAIN,
+            id="explicit-priority",
+        ),
+    ],
+)
+async def test_api_app_logs_format_override(
+    app_api_client_with_root: tuple[TestClient, str],
+    coresys: CoreSys,
+    install_app_ssh: App,
+    journal_logs_reader: MagicMock,
+    query: str,
+    accept: str,
+    formatter: LogFormatter,
+):
+    """Request formatting overrides the app's default log format."""
+    client, root = app_api_client_with_root
+    install_app_ssh.data["log_format"] = "timestamp"
+    resp = await client.get(
+        f"{root}/local_ssh/logs?{query}", headers={"Accept": accept}
+    )
+    assert resp.status == 200
+    journal_logs_reader.assert_called_once_with(
+        ANY, formatter, False, tz=coresys.timezone_tzinfo
+    )

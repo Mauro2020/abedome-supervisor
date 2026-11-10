@@ -1,15 +1,22 @@
 """Test Home Assistant API."""
 
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+import aiohttp
 from awesomeversion import AwesomeVersion
 import pytest
 
+from supervisor.const import SERVER_SOFTWARE
 from supervisor.coresys import CoreSys
 from supervisor.docker.const import ContainerState
 from supervisor.docker.monitor import DockerContainerStateEvent
-from supervisor.exceptions import DockerError, HomeAssistantAPIError
+from supervisor.exceptions import (
+    HomeAssistantAPIError,
+    HomeAssistantAuthError,
+    HomeAssistantWSConnectionError,
+)
 from supervisor.homeassistant.api import APIState, CoreHTTPConfig, HomeAssistantAPI
 from supervisor.homeassistant.const import LANDINGPAGE
 
@@ -118,19 +125,60 @@ async def test_supports_unix_socket(coresys: CoreSys, version: str, expected: bo
 @pytest.mark.parametrize(
     ("version", "env", "expected"),
     [
-        ("2024.1.0", [], False),
-        ("2026.4.0", ["SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock"], True),
-        ("2026.4.0", ["TZ=UTC", "SUPERVISOR_TOKEN=abc"], False),
+        pytest.param("2024.1.0", [], None, id="unsupported-version"),
+        pytest.param(
+            "2024.1.0",
+            ["SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock"],
+            None,
+            id="unsupported-version-with-env",
+        ),
+        pytest.param(
+            "2026.4.0",
+            ["SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock"],
+            Path("/run/os/core.sock"),
+            id="default-path",
+        ),
+        pytest.param(
+            "2026.4.0",
+            ["TZ=UTC", "SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core/core.sock"],
+            Path("/run/os/core/core.sock"),
+            id="non-default-path",
+        ),
+        pytest.param(
+            "2026.4.0",
+            ["SUPERVISOR_CORE_API_SOCKET=/somewhere/else/core.sock"],
+            Path("/run/os/core.sock"),
+            id="unmapped-path-fallback",
+        ),
+        pytest.param("2026.4.0", ["TZ=UTC", "SUPERVISOR_TOKEN=abc"], None, id="no-env"),
     ],
 )
-async def test_use_unix_socket(
-    coresys: CoreSys, version: str, env: list[str], expected: bool
+async def test_core_socket_path(
+    coresys: CoreSys, version: str, env: list[str], expected: Path | None
 ):
-    """Test use_unix_socket based on version and container env."""
+    """Test Core socket path and use_unix_socket based on version and container env."""
     coresys.homeassistant.version = AwesomeVersion(version)
     # pylint: disable-next=protected-access
     coresys.homeassistant.core.instance._meta = {"Config": {"Env": env}}
-    assert coresys.homeassistant.api.use_unix_socket is expected
+    assert coresys.homeassistant.api.core_socket_path == expected
+    assert coresys.homeassistant.api.use_unix_socket is (expected is not None)
+
+
+async def test_unix_session_uses_core_socket_path(coresys: CoreSys):
+    """Test the Unix session connects to the path from the Core container env."""
+    coresys.homeassistant.version = AwesomeVersion("2026.4.0")
+    # pylint: disable-next=protected-access
+    coresys.homeassistant.core.instance._meta = {
+        "Config": {"Env": ["SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core/core.sock"]}
+    }
+    session = coresys.homeassistant.api.session
+    try:
+        assert isinstance(session.connector, aiohttp.UnixConnector)
+        assert session.connector.path == "/run/os/core/core.sock"
+        assert isinstance(session.cookie_jar, aiohttp.DummyCookieJar)
+        assert session.headers[aiohttp.hdrs.USER_AGENT] == SERVER_SOFTWARE
+    finally:
+        await coresys.homeassistant.api.close()
 
 
 # --- api_url / ws_url ---
@@ -140,7 +188,7 @@ async def test_use_unix_socket(
     ("use_unix", "expected_api_url", "expected_ws_url"),
     [
         (True, "http://localhost", "ws://localhost/api/websocket"),
-        (False, "http://172.30.32.1:8123", "ws://172.30.32.1:8123/api/websocket"),
+        (False, "http://172.30.32.1", "ws://172.30.32.1/api/websocket"),
     ],
 )
 async def test_api_and_ws_urls(
@@ -150,6 +198,41 @@ async def test_api_and_ws_urls(
     with patch.object(type(coresys.homeassistant.api), "use_unix_socket", use_unix):
         assert coresys.homeassistant.api.api_url == expected_api_url
         assert coresys.homeassistant.api.ws_url == expected_ws_url
+
+
+@pytest.mark.parametrize(
+    ("port", "ssl", "expected_api_url", "expected_ws_url"),
+    [
+        (80, False, "http://172.30.32.1", "ws://172.30.32.1/api/websocket"),
+        (443, True, "https://172.30.32.1", "wss://172.30.32.1/api/websocket"),
+        (
+            8123,
+            False,
+            "http://172.30.32.1:8123",
+            "ws://172.30.32.1:8123/api/websocket",
+        ),
+        (
+            8123,
+            True,
+            "https://172.30.32.1:8123",
+            "wss://172.30.32.1:8123/api/websocket",
+        ),
+        (80, True, "https://172.30.32.1:80", "wss://172.30.32.1:80/api/websocket"),
+    ],
+)
+async def test_url_omits_default_scheme_port(
+    coresys: CoreSys,
+    port: int,
+    ssl: bool,
+    expected_api_url: str,
+    expected_ws_url: str,
+):
+    """Test the port is only part of the url when the scheme doesn't imply it."""
+    coresys.homeassistant.api_port = port
+    coresys.homeassistant.api_ssl = ssl
+
+    assert coresys.homeassistant.api_url == expected_api_url
+    assert coresys.homeassistant.ws_url == expected_ws_url
 
 
 # --- connection lifecycle ---
@@ -229,6 +312,29 @@ async def test_container_state_changed_ignores_other_containers(
         await api.get_api_state()
     # Should NOT log again since connection state wasn't reset
     assert "Connected to Core" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("name", "state", "expected"),
+    [
+        pytest.param("homeassistant", ContainerState.STOPPED, False, id="stopped"),
+        pytest.param("homeassistant", ContainerState.FAILED, False, id="failed"),
+        pytest.param("homeassistant", ContainerState.HEALTHY, True, id="healthy"),
+        pytest.param("app_local_ssh", ContainerState.STOPPED, True, id="other"),
+    ],
+)
+async def test_core_used_supervisor_socket_reset(
+    coresys: CoreSys, name: str, state: ContainerState, expected: bool
+):
+    """Test Core's socket use is forgotten once its container stops."""
+    api = coresys.homeassistant.api
+    api.core_used_supervisor_socket = True
+
+    await api.container_state_changed(
+        DockerContainerStateEvent(name=name, state=state, id="abc123", time=1)
+    )
+
+    assert api.core_used_supervisor_socket is expected
 
 
 # --- get_api_state / check_api_state ---
@@ -357,12 +463,12 @@ async def test_http_config_pulled_on_connect(
         return_value={"state": "RUNNING", "recorder_state": {}}
     )
     coresys.homeassistant.save_data = AsyncMock()
+    coresys.homeassistant.api_port = 8123
 
-    assert coresys.homeassistant.api_port == 8123
     assert coresys.homeassistant.http_server_host is None
 
     with (
-        patch.object(type(api), "use_unix_socket", True),
+        patch.object(type(api), "core_socket_path", Path("/run/os/core.sock")),
         patch.object(api, "_get_json", return_value=TEST_HTTP_CONFIG) as get_json,
     ):
         await api.get_api_state()
@@ -386,7 +492,7 @@ async def test_http_config_pulled_on_connect(
         )
     )
     with (
-        patch.object(type(api), "use_unix_socket", True),
+        patch.object(type(api), "core_socket_path", Path("/run/os/core.sock")),
         patch.object(api, "_get_json", return_value=TEST_HTTP_CONFIG) as get_json,
     ):
         await api.get_api_state()
@@ -404,9 +510,9 @@ async def test_http_config_unchanged_not_saved(
     )
     coresys.homeassistant.save_data = AsyncMock()
 
-    config = {**TEST_HTTP_CONFIG, "port": 8123, "server_host": ["172.30.32.1"]}
+    config = {**TEST_HTTP_CONFIG, "server_host": ["172.30.32.1"]}
     with (
-        patch.object(type(api), "use_unix_socket", True),
+        patch.object(type(api), "core_socket_path", Path("/run/os/core.sock")),
         patch.object(api, "_get_json", return_value=config),
     ):
         await api.get_api_state()
@@ -437,29 +543,74 @@ async def test_http_config_reset_when_unavailable(
     assert coresys.homeassistant.http_server_host is None
 
 
+def core_state_event(state: ContainerState) -> DockerContainerStateEvent:
+    """Return a container state event for the Core container."""
+    return DockerContainerStateEvent(
+        name="homeassistant", state=state, id="abc123", time=1234567890
+    )
+
+
+CONTAINER_STATE_CASES = [
+    pytest.param([], None, id="unknown"),
+    pytest.param([ContainerState.RUNNING], None, id="running"),
+    pytest.param([ContainerState.STARTING], None, id="starting"),
+    pytest.param(
+        [ContainerState.STOPPED], "Core container is not running", id="stopped"
+    ),
+    pytest.param([ContainerState.FAILED], "Core container is not running", id="failed"),
+    pytest.param(
+        [ContainerState.STOPPED, ContainerState.RUNNING], None, id="restarted"
+    ),
+]
+
+
 # --- make_request ---
 
 
-async def test_make_request_not_running(coresys: CoreSys):
-    """Test make_request raises when Core container is not running."""
-    coresys.homeassistant.core.instance.is_running = AsyncMock(return_value=False)
-
-    with pytest.raises(HomeAssistantAPIError, match="not running"):
-        async with coresys.homeassistant.api.make_request("get", "api/test"):
-            pass
-
-
-async def test_make_request_running_check_docker_error(coresys: CoreSys):
-    """Test make_request wraps Docker errors from running check."""
-    coresys.homeassistant.core.instance.is_running = AsyncMock(
-        side_effect=DockerError("docker failure")
+@pytest.mark.usefixtures("websession")
+async def test_make_request_does_not_inspect_container(coresys: CoreSys):
+    """Test a request is sent without inspecting the Core container first."""
+    api = coresys.homeassistant.api
+    is_running = AsyncMock(return_value=False)
+    coresys.homeassistant.core.instance.is_running = is_running
+    coresys.websession.request = MagicMock(
+        side_effect=lambda *_args, **_kwargs: MockResponse(status=200)
     )
 
-    with pytest.raises(
-        HomeAssistantAPIError, match="Unable to determine if Core container is running"
+    with (
+        patch.object(type(api), "use_unix_socket", False),
+        patch.object(api, "_ensure_access_token", new_callable=AsyncMock),
     ):
-        async with coresys.homeassistant.api.make_request("get", "api/test"):
+        async with api.make_request("get", "api/test") as resp:
+            assert resp.status == 200
+
+    is_running.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("events", "not_running"), CONTAINER_STATE_CASES)
+@pytest.mark.usefixtures("websession")
+async def test_make_request_connection_error(
+    coresys: CoreSys, events: list[ContainerState], not_running: str | None
+):
+    """Test a failed request names a stopped Core container as the cause."""
+    api = coresys.homeassistant.api
+    is_running = AsyncMock(return_value=False)
+    coresys.homeassistant.core.instance.is_running = is_running
+    coresys.websession.request = MagicMock(
+        side_effect=aiohttp.ClientConnectionError("connection refused")
+    )
+    for state in events:
+        await api.container_state_changed(core_state_event(state))
+
+    with (
+        patch.object(type(api), "use_unix_socket", False),
+        patch.object(api, "_ensure_access_token", new_callable=AsyncMock),
+        pytest.raises(HomeAssistantAPIError, match=not_running or "connection refused"),
+    ):
+        async with api.make_request("get", "api/test"):
             pass
+
+    is_running.assert_not_awaited()
 
 
 @pytest.mark.usefixtures("websession")
@@ -492,6 +643,36 @@ async def test_make_request_tcp_with_token_fetch(coresys: CoreSys):
 
 
 @pytest.mark.usefixtures("websession")
+async def test_make_request_sends_path_pre_encoded(coresys: CoreSys):
+    """Test make_request sends the path byte-for-byte, without re-decoding.
+
+    yarl normalizes percent-encoded unreserved characters (%5F -> _) unless the
+    URL is marked as already encoded. The proxy relies on the bytes it checked
+    being the bytes that reach Core.
+    """
+    api = coresys.homeassistant.api
+    api_resp = MagicMock(status=200)
+
+    @asynccontextmanager
+    async def mock_request(*_args, **_kwargs):
+        yield api_resp
+
+    request_mock = MagicMock(side_effect=mock_request)
+    coresys.websession.request = request_mock
+
+    with (
+        patch.object(type(api), "use_unix_socket", False),
+        patch.object(api, "_ensure_access_token", new_callable=AsyncMock),
+    ):
+        async with api.make_request("get", "api/hassio%5Fauth/a%2Fb") as resp:
+            assert resp.status == 200
+
+    url = request_mock.call_args.args[1]
+    assert url.raw_path == "/api/hassio%5Fauth/a%2Fb"
+    assert str(url) == "http://172.30.32.1/api/hassio%5Fauth/a%2Fb"
+
+
+@pytest.mark.usefixtures("websession")
 async def test_make_request_tcp_timeout(coresys: CoreSys):
     """Test make_request wraps TimeoutError."""
     api = coresys.homeassistant.api
@@ -506,12 +687,79 @@ async def test_make_request_tcp_timeout(coresys: CoreSys):
             pass
 
 
+@pytest.mark.usefixtures("websession")
+async def test_make_request_tcp_401_refreshes_token_once(coresys: CoreSys):
+    """Test a 401 over TCP drops the token and retries once."""
+    api = coresys.homeassistant.api
+    api._access_token = "stale"  # pylint: disable=protected-access
+    coresys.websession.request = MagicMock(
+        side_effect=[MockResponse(status=401), MockResponse(status=200)]
+    )
+
+    with (
+        patch.object(type(api), "use_unix_socket", False),
+        patch.object(api, "_ensure_access_token", new_callable=AsyncMock) as ensure,
+    ):
+        async with api.make_request("get", "api/test") as resp:
+            assert resp.status == 200
+
+    assert coresys.websession.request.call_count == 2
+    assert ensure.await_count == 2
+
+
+@pytest.mark.usefixtures("websession")
+async def test_make_request_tcp_401_after_refresh_raises(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test a 401 with a freshly refreshed token raises HomeAssistantAuthError."""
+    api = coresys.homeassistant.api
+    coresys.websession.request = MagicMock(
+        side_effect=[MockResponse(status=401), MockResponse(status=401)]
+    )
+
+    with (
+        patch.object(type(api), "use_unix_socket", False),
+        patch.object(api, "_ensure_access_token", new_callable=AsyncMock),
+        pytest.raises(HomeAssistantAuthError),
+    ):
+        async with api.make_request("get", "api/test"):
+            pass
+
+    assert coresys.websession.request.call_count == 2
+    assert (
+        "Home Assistant rejected Supervisor credentials on api/test "
+        "after token refresh" in caplog.text
+    )
+
+
+@pytest.mark.usefixtures("websession")
+async def test_make_request_unix_socket_401_raises(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test a 401 over the Unix socket raises HomeAssistantAuthError right away."""
+    api = coresys.homeassistant.api
+    session = MagicMock()
+    session.request = MagicMock(return_value=MockResponse(status=401))
+
+    with (
+        patch.object(type(api), "use_unix_socket", True),
+        patch.object(
+            type(api), "session", new_callable=PropertyMock, return_value=session
+        ),
+        pytest.raises(HomeAssistantAuthError),
+    ):
+        async with api.make_request("get", "api/test"):
+            pass
+
+    session.request.assert_called_once()
+    assert "Home Assistant rejected Supervisor credentials on api/test" in caplog.text
+
+
 # --- connect_websocket ---
 
 
 async def test_connect_websocket_unix(coresys: CoreSys):
     """Test connect_websocket uses WSClient.connect for Unix socket."""
-    coresys.homeassistant.core.instance.is_running = AsyncMock(return_value=True)
     mock_ws_client = MagicMock()
     with (
         patch.object(type(coresys.homeassistant.api), "use_unix_socket", True),
@@ -527,16 +775,69 @@ async def test_connect_websocket_unix(coresys: CoreSys):
     mock_connect.assert_called_once()
 
 
-async def test_connect_websocket_running_check_docker_error(coresys: CoreSys):
-    """Test connect_websocket wraps Docker errors from running check."""
-    coresys.homeassistant.core.instance.is_running = AsyncMock(
-        side_effect=DockerError("docker failure")
-    )
+@pytest.mark.parametrize(
+    ("use_unix_socket", "connect"),
+    [
+        pytest.param(True, "connect", id="unix"),
+        pytest.param(False, "connect_with_auth", id="tcp"),
+    ],
+)
+@pytest.mark.parametrize(("events", "not_running"), CONTAINER_STATE_CASES)
+@pytest.mark.usefixtures("websession")
+async def test_connect_websocket_connection_error(
+    coresys: CoreSys,
+    use_unix_socket: bool,
+    connect: str,
+    events: list[ContainerState],
+    not_running: str | None,
+):
+    """Test a failed WebSocket connect names a stopped Core container as the cause."""
+    api = coresys.homeassistant.api
+    for state in events:
+        await api.container_state_changed(core_state_event(state))
 
-    with pytest.raises(
-        HomeAssistantAPIError, match="Unable to determine if Core container is running"
+    with (
+        patch.object(type(api), "use_unix_socket", use_unix_socket),
+        patch.object(api, "_ensure_access_token", new_callable=AsyncMock),
+        patch.object(api, "_access_token", "token"),
+        patch(
+            f"supervisor.homeassistant.api.WSClient.{connect}",
+            new_callable=AsyncMock,
+            side_effect=HomeAssistantWSConnectionError("Can't connect"),
+        ),
+        pytest.raises(
+            HomeAssistantWSConnectionError, match=not_running or "Can't connect"
+        ),
     ):
-        await coresys.homeassistant.api.connect_websocket()
+        await api.connect_websocket()
+
+
+@pytest.mark.parametrize(("events", "not_running"), CONTAINER_STATE_CASES)
+@pytest.mark.usefixtures("websession")
+async def test_connect_websocket_tcp_token_fetch_error(
+    coresys: CoreSys, events: list[ContainerState], not_running: str | None
+):
+    """Test a failed token fetch before a TCP connect raises a connection error."""
+    api = coresys.homeassistant.api
+    coresys.websession.post = MagicMock(
+        side_effect=aiohttp.ClientConnectionError("connection refused")
+    )
+    for state in events:
+        await api.container_state_changed(core_state_event(state))
+
+    with (
+        patch.object(type(api), "use_unix_socket", False),
+        patch(
+            "supervisor.homeassistant.api.WSClient.connect_with_auth",
+            new_callable=AsyncMock,
+        ) as mock_connect,
+        pytest.raises(
+            HomeAssistantWSConnectionError, match=not_running or "connection refused"
+        ),
+    ):
+        await api.connect_websocket()
+
+    mock_connect.assert_not_called()
 
 
 @pytest.mark.usefixtures("websession")

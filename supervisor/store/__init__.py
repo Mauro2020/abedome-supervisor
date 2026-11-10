@@ -3,13 +3,20 @@
 import asyncio
 from collections.abc import Awaitable
 import logging
+from pathlib import Path
 
-from ..const import ATTR_REPOSITORIES, REPOSITORY_CORE, URL_HASSIO_APPS
+from ..const import (
+    ATTR_REPOSITORIES,
+    REPOSITORY_CORE,
+    URL_HASSIO_APPS,
+    URL_HASSIO_APPS_LEGACY,
+)
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
     StoreError,
     StoreGitCloneError,
     StoreGitError,
+    StoreGitRemoteURLUpdateError,
     StoreInvalidAppRepo,
     StoreJobError,
     StoreNotFound,
@@ -37,6 +44,14 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
         self.coresys: CoreSys = coresys
         self.data = StoreData(coresys)
         self._repositories: dict[str, Repository] = {}
+        self._reported_unsafe_files: set[tuple[str, Path]] = set()
+
+    def first_unsafe_file_report(self, slug: str, path: Path) -> bool:
+        """Return True if an app's refused file is not yet reported since the last reload."""
+        if (slug, path) in self._reported_unsafe_files:
+            return False
+        self._reported_unsafe_files.add((slug, path))
+        return True
 
     @property
     def all(self) -> list[Repository]:
@@ -85,6 +100,7 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
     )
     async def reload(self, repository: Repository | None = None) -> None:
         """Update apps from repository and reload list."""
+        self._reported_unsafe_files.clear()
         # Make a copy to prevent race with other tasks
         repositories = [repository] if repository else self.all.copy()
         results: list[bool | BaseException] = await asyncio.gather(
@@ -142,7 +158,7 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
         self, url: str, *, persist: bool = True, issue_on_error: bool = False
     ) -> None:
         """Add a repository."""
-        if url == URL_HASSIO_APPS:
+        if url in (URL_HASSIO_APPS, URL_HASSIO_APPS_LEGACY):
             url = REPOSITORY_CORE
 
         repository = Repository.create(self.coresys, url)
@@ -161,6 +177,15 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
                     ContextType.STORE,
                     reference=repository.slug,
                     suggestions=[SuggestionType.EXECUTE_REMOVE],
+                )
+            else:
+                await repository.remove()
+                raise err
+
+        except StoreGitRemoteURLUpdateError as err:
+            if issue_on_error:
+                _LOGGER.warning(
+                    "Can't update origin URL for repository %s: %s", url, err
                 )
             else:
                 await repository.remove()

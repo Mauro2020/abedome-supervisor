@@ -4,12 +4,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import logging
 import re
-from typing import Final
+from typing import TYPE_CHECKING, Final
 from urllib.parse import unquote
 
 from aiohttp.web import Request, StreamResponse, middleware
 from aiohttp.web_exceptions import HTTPBadRequest, HTTPForbidden, HTTPUnauthorized
 
+from ...apps.app import App
 from ...apps.const import RE_SLUG
 from ...const import (
     REQUEST_FROM,
@@ -21,7 +22,12 @@ from ...const import (
     VALID_API_STATES,
 )
 from ...coresys import CoreSys, CoreSysAttributes
+from ...resolution.const import ContextType, IssueType
+from ..sockets import is_unix_socket_request
 from ..utils import api_return_error, extract_supervisor_token
+
+if TYPE_CHECKING:
+    from .. import RestAPI
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -56,24 +62,26 @@ OBSERVER_CHECK: Final = re.compile(
     r")$"
 )
 
+# Multi-keyword patterns are anchored per line and use atomic lazy scans so
+# matching stays linear; unanchored ".*" chains backtrack cubically.
 FILTERS: Final = re.compile(
     r"(?:"
 
     # Common exploits
     r"proc/self/environ"
-    r"|(<|%3C).*script.*(>|%3E)"
+    r"|^(?>.*?(?:<|%3C))(?>.*?script).*?(?:>|%3E)"
 
     # File Injections
     r"|(\.\.//?)+"  # ../../anywhere
     r"|[a-zA-Z0-9_]=/([a-z0-9_.]//?)+"  # .html?v=/.//test
 
     # SQL Injections
-    r"|union.*select.*\("
-    r"|union.*all.*select.*"
-    r"|concat.*\("
+    r"|^(?>.*?union)(?>.*?select).*?\("
+    r"|^(?>.*?union)(?>.*?all).*?select"
+    r"|^(?>.*?concat).*?\("
 
     r")",
-    flags=re.IGNORECASE,
+    flags=re.IGNORECASE | re.MULTILINE,
 )
 
 @dataclass(slots=True, frozen=True)
@@ -109,6 +117,7 @@ _V1_PATTERNS: Final = _AppSecurityPatterns(
     core_only=re.compile(
         r"^(?:"
         r"/addons/" + RE_SLUG + r"/sys_options"
+        r"|/os/ssh/authorized_keys"
         r")$"
     ),
     role_access={
@@ -150,13 +159,14 @@ _V1_PATTERNS: Final = _AppSecurityPatterns(
             r"|/multicast/.+"
             r"|/network/.+"
             r"|/observer/.+"
-            r"|/os/(?!datadisk/wipe).+"
+            r"|/os/(?!datadisk/wipe|ssh/authorized_keys).+"
             r"|/refresh_updates"
             r"|/resolution/.+"
             r"|/security/.+"
             r"|/snapshots.*"
             r"|/store.*"
             r"|/supervisor/.+"
+            r"|/time/.+"
             r")$"
         ),
         ROLE_ADMIN: re.compile(r".*"),
@@ -190,6 +200,7 @@ _V2_PATTERNS: Final = _AppSecurityPatterns(
     core_only=re.compile(
         r"^/v2(?:"
         r"/apps/" + RE_SLUG + r"/sys_options"
+        r"|/os/ssh/authorized_keys"
         r")$"
     ),
     role_access={
@@ -230,12 +241,13 @@ _V2_PATTERNS: Final = _AppSecurityPatterns(
             r"|/multicast/.+"
             r"|/network/.+"
             r"|/observer/.+"
-            r"|/os/(?!datadisk/wipe).+"
+            r"|/os/(?!datadisk/wipe|ssh/authorized_keys).+"
             r"|/reload_updates"
             r"|/resolution/.+"
             r"|/security/.+"
             r"|/store.*"
             r"|/supervisor/.+"
+            r"|/time/.+"
             r")$"
         ),
         ROLE_ADMIN: re.compile(r".*"),
@@ -258,31 +270,38 @@ def _get_app_security_patterns(request: Request) -> _AppSecurityPatterns:
     return _V1_PATTERNS
 
 
+def recursive_unquote(value: str) -> str:
+    """Percent-decode a value until it no longer changes.
+
+    Use this to canonicalize a path before matching it against a deny pattern,
+    so that multiply-encoded variants (e.g. %255F for "_") can't slip past.
+    """
+    while (unquoted := unquote(value)) != value:
+        value = unquoted
+    return value
+
+
 class SecurityMiddleware(CoreSysAttributes):
     """Security middleware functions."""
 
-    def __init__(self, coresys: CoreSys):
+    def __init__(self, coresys: CoreSys, api: RestAPI):
         """Initialize security middleware."""
         self.coresys: CoreSys = coresys
-
-    def _recursive_unquote(self, value: str) -> str:
-        """Handle values that are encoded multiple times."""
-        if (unquoted := unquote(value)) != value:
-            unquoted = self._recursive_unquote(unquoted)
-        return unquoted
+        self._api: RestAPI = api
+        self._tcp_api_request_paths: set[str] = set()
 
     @middleware
     async def block_bad_requests(
         self, request: Request, handler: Callable[[Request], Awaitable[StreamResponse]]
     ) -> StreamResponse:
         """Process request and tblock commonly known exploit attempts."""
-        if FILTERS.search(self._recursive_unquote(request.path)):
+        if FILTERS.search(recursive_unquote(request.path)):
             _LOGGER.warning(
                 "Filtered a potential harmful request to: %s", request.raw_path
             )
             raise HTTPBadRequest
 
-        if FILTERS.search(self._recursive_unquote(request.query_string)):
+        if FILTERS.search(recursive_unquote(request.query_string)):
             _LOGGER.warning(
                 "Filtered a request with a potential harmful query string: %s",
                 request.raw_path,
@@ -308,14 +327,32 @@ class SecurityMiddleware(CoreSysAttributes):
         self, request: Request, handler: Callable[[Request], Awaitable[StreamResponse]]
     ) -> StreamResponse:
         """Check security access of this layer."""
-        request_from: CoreSysAttributes | None = None
-        supervisor_token = extract_supervisor_token(request)
         patterns = _get_app_security_patterns(request)
 
-        # Blacklist
-        if BLACKLIST.match(request.path):
+        # Blacklist. Match the fully decoded path: request.path is only decoded
+        # once, so a double-encoded variant would otherwise pass here and be
+        # re-decoded downstream.
+        if BLACKLIST.match(recursive_unquote(request.path)):
             _LOGGER.error("%s is blacklisted!", request.path)
             raise HTTPForbidden
+
+        # A dropped connection can't tell a socket from TCP, so fail closed
+        if request.transport is None:
+            _LOGGER.debug("Request to %s without connection", request.path)
+            raise HTTPForbidden
+
+        # The socket identifies the caller, a token is never read on one
+        if is_unix_socket_request(request):
+            if not (principal := self._api.sockets.principal_for(request)):
+                _LOGGER.error("Request to %s on an unregistered socket", request.path)
+                raise HTTPForbidden
+            if not patterns.no_security_check.match(request.path):
+                self.check_principal_access(principal, request)
+                # Not on passthrough paths, Supervisor's watchdog pings this socket
+                if principal is self.sys_homeassistant:
+                    self.sys_homeassistant.api.core_used_supervisor_socket = True
+            request[REQUEST_FROM] = principal
+            return await handler(request)
 
         # Ignore security check
         if patterns.no_security_check.match(request.path):
@@ -324,15 +361,70 @@ class SecurityMiddleware(CoreSysAttributes):
             return await handler(request)
 
         # Not token
-        if not supervisor_token:
+        if not (supervisor_token := extract_supervisor_token(request)):
             _LOGGER.warning("No API token provided for %s", request.path)
             raise HTTPUnauthorized
 
-        # Home-Assistant
+        if not (principal := self._principal_for_token(supervisor_token)):
+            if patterns.core_only.match(request.path):
+                _LOGGER.warning(
+                    "Attempted access to %s from client besides Home Assistant",
+                    request.path,
+                )
+            else:
+                _LOGGER.error("Invalid token for access %s", request.path)
+            raise HTTPForbidden
+
+        self.check_principal_access(principal, request)
+        if principal is self.sys_homeassistant:
+            self._report_tcp_api_request(request)
+        request[REQUEST_FROM] = principal
+        return await handler(request)
+
+    def _report_tcp_api_request(self, request: Request) -> None:
+        """Report a request using Core's token over TCP, once per path and boot."""
+        if (
+            not self.sys_homeassistant.api.core_used_supervisor_socket
+            or request.path in self._tcp_api_request_paths
+        ):
+            return
+
+        _LOGGER.warning(
+            "Request to %s used Home Assistant's Supervisor token over TCP. Home "
+            "Assistant's built-in integrations no longer do this, so it likely "
+            "comes from your configuration (such as a shell_command or command_line "
+            "entity) or a custom integration. Support for this will be removed in "
+            "a future release",
+            request.path,
+        )
+        if not self._tcp_api_request_paths:
+            self.sys_resolution.create_issue(
+                IssueType.DEPRECATED_TCP_API_REQUEST, ContextType.CORE, request.path
+            )
+        self._tcp_api_request_paths.add(request.path)
+
+    def _principal_for_token(self, supervisor_token: str) -> CoreSysAttributes | None:
+        """Return the principal a Supervisor token was issued to."""
         if supervisor_token == self.sys_homeassistant.supervisor_token:
+            return self.sys_homeassistant
+        if supervisor_token == self.sys_plugins.cli.supervisor_token:
+            return self.sys_host
+        if supervisor_token == self.sys_plugins.observer.supervisor_token:
+            return self.sys_plugins.observer
+        return self.sys_apps.from_token(supervisor_token)
+
+    def check_principal_access(
+        self, principal: CoreSysAttributes, request: Request
+    ) -> None:
+        """Raise HTTPForbidden unless the principal may access the request path."""
+        patterns = _get_app_security_patterns(request)
+
+        # Home-Assistant
+        if principal is self.sys_homeassistant:
             _LOGGER.debug("%s access from Home Assistant", request.path)
-            request_from = self.sys_homeassistant
-        elif patterns.core_only.match(request.path):
+            return
+
+        if patterns.core_only.match(request.path):
             _LOGGER.warning(
                 "Attempted access to %s from client besides Home Assistant",
                 request.path,
@@ -340,40 +432,31 @@ class SecurityMiddleware(CoreSysAttributes):
             raise HTTPForbidden
 
         # Host
-        if supervisor_token == self.sys_plugins.cli.supervisor_token:
+        if principal is self.sys_host:
             _LOGGER.debug("%s access from Host", request.path)
-            request_from = self.sys_host
+            return
 
         # Observer
-        if supervisor_token == self.sys_plugins.observer.supervisor_token:
+        if principal is self.sys_plugins.observer:
             if not OBSERVER_CHECK.match(request.path):
                 _LOGGER.warning("%s invalid Observer access", request.path)
                 raise HTTPForbidden
             _LOGGER.debug("%s access from Observer", request.path)
-            request_from = self.sys_plugins.observer
+            return
 
         # App
-        app = None
-        if supervisor_token and not request_from:
-            app = self.sys_apps.from_token(supervisor_token)
-
-        # Check App API access
-        if app and patterns.api_bypass.match(request.path):
-            _LOGGER.debug("Passthrough %s from %s", request.path, app.slug)
-            request_from = app
-        elif app and app.access_hassio_api:
-            # Check Role
-            if patterns.role_access[app.hassio_role].match(request.path):
-                _LOGGER.info("%s access from %s", request.path, app.slug)
-                request_from = app
+        if isinstance(principal, App):
+            if patterns.api_bypass.match(request.path):
+                _LOGGER.debug("Passthrough %s from %s", request.path, principal.slug)
+                return
+            if principal.access_hassio_api:
+                if patterns.role_access[principal.hassio_role].match(request.path):
+                    _LOGGER.info("%s access from %s", request.path, principal.slug)
+                    return
+                _LOGGER.warning("%s no role for %s", request.path, principal.slug)
             else:
-                _LOGGER.warning("%s no role for %s", request.path, app.slug)
-        elif app:
-            _LOGGER.warning("%s missing API permission for %s", app.slug, request.path)
+                _LOGGER.warning(
+                    "%s missing API permission for %s", principal.slug, request.path
+                )
 
-        if request_from:
-            request[REQUEST_FROM] = request_from
-            return await handler(request)
-
-        _LOGGER.error("Invalid token for access %s", request.path)
         raise HTTPForbidden

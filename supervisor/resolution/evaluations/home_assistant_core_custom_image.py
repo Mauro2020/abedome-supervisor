@@ -22,7 +22,7 @@ class EvaluateHomeAssistantCoreCustomImage(EvaluateBase):
     @property
     def on_failure(self) -> str:
         """Return a string that is printed when self.evaluate is True."""
-        return f"ABEDOME Core is using the non-default image '{self.sys_homeassistant.image}'!"
+        return f"Home Assistant Core is using the non-default image '{self.sys_homeassistant.image}'!"
 
     @property
     def states(self) -> list[CoreState]:
@@ -31,7 +31,4 @@ class EvaluateHomeAssistantCoreCustomImage(EvaluateBase):
 
     async def evaluate(self) -> bool:
         """Run evaluation."""
-        return self.sys_homeassistant.image not in {
-            self.sys_homeassistant.default_image,
-            self.sys_updater.image_homeassistant,
-        }
+        return self.sys_homeassistant.image != self.sys_homeassistant.default_image
